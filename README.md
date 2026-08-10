@@ -45,3 +45,107 @@ You can also install WinSQLite Editor directly from your command line:
 
 ```powershell
 winget install WinSQLiteEditor
+```
+
+---
+
+## ⚖️ Edition Comparison
+
+| Feature / Benefit | Microsoft Store | Portable Archive (.zip) |
+| :--- | :---: | :---: |
+| **Full Core Functionality** | ✅ | ✅ |
+| **100% Offline & Privacy-First** | ✅ | ✅ |
+| **Automatic Background Updates** | ✅ | ❌ *(Manual download)* |
+| **One-Click Clean Install & Uninstall** | ✅ | ❌ *(Manual zip extraction)* |
+| **Verified & Validated Security** | ✅ *(Store Checked)* | ✅ |
+| **Support Independent Open-Source Dev** | ❤️ Recommended | ☕ Optional |
+
+---
+
+## ✨ Key Features
+
+* **📂 Database & Schema Management:** Seamlessly open, inspect, and manage SQLite database schemas, tables, fields, triggers, and indices.
+* **📝 Smart SQL Editor:** Built-in code editor equipped with **syntax highlighting** and **context-aware autocomplete** for rapid SQL drafting.
+* **⚡ Ultra Fast & Native:** Built natively with **C++** and **Qt 6** to ensure minimal resource overhead and lightning-fast query execution.
+* **🔍 Visual Data Browser:** View, inline-edit, search, and filter table records intuitively without writing manual `SELECT` queries.
+* **🔒 Privacy-First & Lightweight:** 100% offline-first utility with zero telemetry, zero trackers, and no bloatware.
+
+---
+
+## 📸 Screenshots
+
+| Schema & Table Browser | SQL Query & Results Execution |
+| :---: | :---: |
+| ![App Screenshot](screenshot1.png) | ![App Screenshot](screenshot2.png) |
+
+---
+
+## 🎬 Video Demonstration
+
+Watch a full walkthrough of WinSQLite Editor in action on YouTube:
+
+<div align="center">
+
+[![Watch WinSQLite Editor Demo](https://img.youtube.com/vi/KNKUBTin_FY/maxresdefault.jpg)](https://www.youtube.com/watch?v=KNKUBTin_FY)
+
+*Click the image above to play the demo on YouTube*
+
+</div>
+
+---
+
+## 🛡️ Privacy & Security
+
+WinSQLite Editor is built with a strict **privacy-first philosophy**:
+* **No Telemetry:** No analytics, tracking, or background network requests.
+* **100% Offline:** Operates completely standalone without any cloud dependencies.
+* **Clean & Safe:** Certified free of third-party bundlers or unwanted adware.
+
+---
+
+## 🛠️ Building from Source
+
+### Prerequisites
+* **Windows 10/11**
+* **Qt 6.x** (Core, GUI, Widgets, Sql modules)
+* **CMake 3.16+**
+* **C++17 or C++20** compatible compiler (MSVC 2022 or MinGW)
+
+### Build Steps
+
+1. **Clone the repository:**
+   ```bash
+   git clone [https://github.com/srdzank/SQLite-Editor.git](https://github.com/srdzank/SQLite-Editor.git)
+   cd SQLite-Editor
+   ```
+
+2. **Configure with CMake:**
+   ```bash
+   cmake -B build -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2019_64"
+   ```
+
+3. **Build the binary:**
+   ```bash
+   cmake --build build --config Release
+   ```
+
+---
+
+## 🤝 Contributing & Feedback
+
+Contributions, feature suggestions, and bug reports are highly welcome!
+* Found a bug? Open an [Issue](https://github.com/srdzank/SQLite-Editor/issues).
+* Want to contribute code? Feel free to submit a [Pull Request](https://github.com/srdzank/SQLite-Editor/pulls).
+
+---
+
+## 📄 License
+
+This project is licensed under the **MIT License** - see the [LICENSE](LICENSE) file for details.
+
+<div align="center">
+
+---
+**If you find WinSQLite Editor useful, please give this repository a ⭐ star on GitHub to support the project!**
+
+</div>
