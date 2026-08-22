@@ -16,6 +16,15 @@
 
 </div>
 
+## 🎬 Video Demonstration
+
+<div align="center">
+
+![WinSQLite Editor Demo](demo.gif)
+
+*WinSQLite Editor in action: Instant startup, visual query building, and native execution.*
+
+</div>
 ---
 
 ## 🌟 Overview
