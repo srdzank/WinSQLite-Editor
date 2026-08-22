@@ -87,22 +87,6 @@ winget install WinSQLiteEditor
 | :---: | :---: |
 | ![App Screenshot](screenshot1.png) | ![App Screenshot](screenshot2.png) |
 
----
-
-## 🎬 Video Demonstration
-
-Watch a full walkthrough of WinSQLite Editor in action on YouTube:
-
-<div align="center">
-
-[![Watch WinSQLite Editor Demo](https://img.youtube.com/vi/KNKUBTin_FY/maxresdefault.jpg)](https://www.youtube.com/watch?v=KNKUBTin_FY)
-
-*Click the image above to play the demo on YouTube*
-
-</div>
-
----
-
 ## 🛡️ Privacy & Security
 
 WinSQLite Editor is built with a strict **privacy-first philosophy**:
