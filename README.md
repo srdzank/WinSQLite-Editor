@@ -103,6 +103,19 @@ Qt 6.x (Core, GUI, Widgets, Sql modules)
 *CMake 3.16+
 C++17 or C++20 compatible compiler (MSVC 2022 or MinGW)
 
+Linux (Ubuntu / Debian)
+
+# Install build tools and Qt 6 dependencies
+sudo apt update
+sudo apt install build-essential cmake qt6-base-dev qt6-base-dev-tools
+
+# Clone and build
+git clone https://github.com/srdzank/WinSQLite-Editor.git
+cd WinSQLite-Editor
+mkdir build && cd build
+cmake ..
+make -j$(nproc)
+
 Contributing & Feedback
 
 Contributions, feature suggestions, and bug reports are highly welcome!
