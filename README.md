@@ -19,7 +19,6 @@ A lightweight, lightning-fast, and native SQLite database browser built with C++
 
 <div align="center">
 
-![WinSQLite Editor Demo](demo.gif)
 
 *WinSQLite Editor in action: Instant startup, visual query building, and native execution.*
 
