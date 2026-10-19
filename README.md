@@ -83,7 +83,7 @@ Screenshots
 
 | Schema & Table Browser | SQL Query & Results Execution |
 | :---: | :---: |
-| ![App Screenshot](screenshot1.png) | ![App Screenshot](screenshot2.png) |
+| ![App Screenshot](pic100.png) | ![App Screenshot](pic101.png) |
 
 Privacy & Security
 
