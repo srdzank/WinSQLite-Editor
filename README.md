@@ -85,6 +85,14 @@ Screenshots
 | :---: | :---: |
 | ![App Screenshot](pic100.png) | ![App Screenshot](pic101.png) |
 
+## 📺 Video Demo & Screenshots
+
+Watch the video walkthrough to see **WinSQLite Editor** in action:
+
+[![WinSQLite Editor Video Demo](https://img.youtube.com/vi/ng3xPzv9edw/maxresdefault.jpg)](https://www.youtube.com/watch?v=ng3xPzv9edw)
+
+*Click the image above to watch the demo on YouTube.*
+
 Privacy & Security
 
 WinSQLite Editor is built with a strict privacy-first philosophy:
