@@ -29,6 +29,7 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QTextCursor>
 #include <QTextStream>
 #include <QVariantMap>
 
@@ -348,7 +349,7 @@ void MainWindow::buildUi()
     setCentralWidget(central);
 
     connect(m_tableTree, &QTreeWidget::itemClicked, this, &MainWindow::onTreeItemClicked);
-    connect(m_diagramView, &DiagramView::tableClicked, this, &MainWindow::onTableActivated);
+    connect(m_diagramView, &DiagramView::joinCandidateClicked, this, &MainWindow::onJoinCandidateClicked);
     connect(m_addStepBtn, &QPushButton::clicked, this, &MainWindow::onAddStepClicked);
     connect(m_sqlModeBtn, &QPushButton::toggled, this, &MainWindow::onSqlModeToggled);
     connect(m_executeBtn, &QPushButton::clicked, this, &MainWindow::onExecuteClicked);
@@ -484,6 +485,20 @@ void MainWindow::applyDarkTheme()
             font-weight: 600; padding: 0px;
         }
         QPushButton#removeStepButton:hover { color: #E5484D; }
+        QToolTip {
+            background-color: #2C2C2A; color: #F1EFE8;
+            border: 1px solid #5F5E5A; padding: 4px 6px;
+        }
+        QCheckBox { spacing: 8px; }
+        QCheckBox::indicator {
+            width: 16px; height: 16px; border-radius: 3px;
+            border: 1px solid #888780; background-color: #201F22;
+        }
+        QCheckBox::indicator:hover { border: 1px solid #378ADD; }
+        QCheckBox::indicator:checked {
+            background-color: #185FA5; border: 1px solid #378ADD;
+            image: url(:/resources/check.png);
+        }
     )").arg(m_uiFontSize).arg(titleFontSize).arg(m_editorFontSize));
 }
 
@@ -523,7 +538,7 @@ bool MainWindow::openDatabase(const QString& path)
 
     const QString initialFocus = defaultFocusTable();
     if (!initialFocus.isEmpty()) {
-        focusTable(initialFocus);
+        startQueryFrom(initialFocus);
     }
 
     return true;
@@ -640,40 +655,76 @@ void MainWindow::onTableActivated(const QString& tableName)
     }
 
     if (m_sqlModeActive) {
-        // In SQL mode, clicking a table in the diagram inserts its name
-        // into the raw SQL at the cursor instead of touching the builder
-        // - the other half of the "typing affects the diagram" loop.
+        // In SQL mode, clicking a table in the tree inserts its name into
+        // the raw SQL at the cursor instead of touching the builder.
         m_sqlEditor->insertPlainText(tableName);
         m_sqlEditor->setFocus();
         return;
     }
 
-    focusTable(tableName);
+    // Picking a table in the tree means "start a query from this table".
+    // If it's already part of the query being built, leave the query alone.
+    if (m_queryModel.involvedTables().contains(tableName)) {
+        return;
+    }
+    startQueryFrom(tableName);
 }
 
-void MainWindow::focusTable(const QString& tableName)
+void MainWindow::startQueryFrom(const QString& tableName)
 {
-    if (tableName.isEmpty() || tableName == m_focusTable) {
+    if (tableName.isEmpty()) {
         return;
     }
     m_focusTable = tableName;
 
-    m_diagramView->setFocusTable(m_schema, tableName);
-
-    // Rebuild the query model: FROM = focus table, JOIN = first relation
-    // found, mirroring what a click on a relation line will eventually
-    // do explicitly (phase 3). Further joins/conditions can be added
-    // manually with "+ Add step".
     m_queryModel = QueryModel();
     m_queryModel.setFromTable(tableName);
-    auto relations = m_schema.relationsFor(tableName);
-    if (!relations.isEmpty()) {
-        const auto& fk = relations.first();
-        const QString joinTable = (fk.fromTable == tableName) ? fk.toTable : fk.fromTable;
-        m_queryModel.addJoin(joinTable, fk);
-    }
 
     refreshQueryPanel();
+}
+
+void MainWindow::onJoinCandidateClicked(const QString& tableName)
+{
+    // Every way this table can be joined to what's already in the query
+    // (usually one; several when e.g. two columns both reference it).
+    QVector<JoinCandidate> options;
+    for (const auto& c : m_schema.joinCandidates(currentQueryTables())) {
+        if (c.table == tableName) {
+            options.push_back(c);
+        }
+    }
+    if (options.isEmpty()) {
+        return;
+    }
+
+    int chosen = 0;
+    if (options.size() > 1) {
+        QMenu menu(this);
+        for (const auto& c : options) {
+            const auto& fk = c.relation;
+            menu.addAction(QString("%1.%2 = %3.%4").arg(fk.fromTable, fk.fromColumn, fk.toTable, fk.toColumn));
+        }
+        QAction* picked = menu.exec(QCursor::pos());
+        if (!picked) {
+            return;
+        }
+        chosen = menu.actions().indexOf(picked);
+        if (chosen < 0) {
+            return;
+        }
+    }
+
+    addJoinToQuery(options[chosen]);
+}
+
+void MainWindow::addJoinToQuery(const JoinCandidate& candidate)
+{
+    if (m_sqlModeActive) {
+        insertJoinIntoSql(candidate);   // textChanged -> refreshDiagram()
+    } else {
+        m_queryModel.addJoin(candidate.table, candidate.relation);
+        refreshQueryPanel();            // also refreshes the diagram
+    }
 }
 
 void MainWindow::refreshQueryPanel()
@@ -720,6 +771,7 @@ void MainWindow::refreshQueryPanel()
     }
 
     m_sqlPreview->setPlainText(m_queryModel.toSql());
+    refreshDiagram();
 }
 
 void MainWindow::onAddStepClicked()
@@ -731,73 +783,51 @@ void MainWindow::onAddStepClicked()
     QMenu menu(this);
     QAction* joinAction = menu.addAction("Join related table (JOIN)…");
     QAction* conditionAction = menu.addAction("Add condition (WHERE)…");
+    menu.addSeparator();
+    QAction* resetAction = menu.addAction("Start over (keep only FROM)");
     QAction* chosen = menu.exec(m_addStepBtn->mapToGlobal(QPoint(0, m_addStepBtn->height())));
 
     if (chosen == joinAction) {
         addJoinStep();
     } else if (chosen == conditionAction) {
         addConditionStep();
+    } else if (chosen == resetAction) {
+        startQueryFrom(m_queryModel.fromTable());
     }
 }
 
 void MainWindow::addJoinStep()
 {
-    // Candidate joins: any relation touching a table already in the
-    // query, whose "other side" isn't already joined in.
-    const QVector<QString> involved = m_queryModel.involvedTables();
-    QVector<ForeignKey> candidateKeys;
-    QStringList candidateLabels;
-
-    for (const auto& table : involved) {
-        for (const auto& fk : m_schema.relationsFor(table)) {
-            const QString other = (fk.fromTable == table) ? fk.toTable : fk.fromTable;
-            if (other == table || involved.contains(other)) {
-                continue;
-            }
-            candidateKeys.push_back(fk);
-            candidateLabels << QString("%1  (%2.%3 → %4.%5)")
-                                    .arg(other, fk.fromTable, fk.fromColumn, fk.toTable, fk.toColumn);
-        }
-    }
-
-    if (candidateLabels.isEmpty()) {
+    // Same candidate list the diagram draws as dashed nodes, so the
+    // dialog and the diagram always offer exactly the same joins.
+    const QVector<JoinCandidate> candidates = m_schema.joinCandidates(m_queryModel.involvedTables());
+    if (candidates.isEmpty()) {
         QMessageBox::information(this, "No available relations",
                                   "All related tables are already included in the query.");
         return;
     }
 
+    QStringList labels;
+    for (const auto& c : candidates) {
+        const auto& fk = c.relation;
+        labels << QString("%1  (%2.%3 → %4.%5)")
+                      .arg(c.table, fk.fromTable, fk.fromColumn, fk.toTable, fk.toColumn);
+    }
+
     bool ok = false;
     const QString choice = QInputDialog::getItem(this, "Join table",
                                                    "Select a relation for JOIN:",
-                                                   candidateLabels, 0, false, &ok);
+                                                   labels, 0, false, &ok);
     if (!ok) {
         return;
     }
 
-    const int index = candidateLabels.indexOf(choice);
+    const int index = labels.indexOf(choice);
     if (index < 0) {
         return;
     }
 
-    const ForeignKey& fk = candidateKeys[index];
-
-    // The candidate was built from the "other" side of the relation
-    // relative to a table already in the query - recompute which side
-    // that is so we join in the correct table name.
-    QString otherTable = fk.fromTable;
-    for (const auto& table : involved) {
-        if (fk.fromTable == table) {
-            otherTable = fk.toTable;
-            break;
-        }
-        if (fk.toTable == table) {
-            otherTable = fk.fromTable;
-            break;
-        }
-    }
-
-    m_queryModel.addJoin(otherTable, fk);
-    refreshQueryPanel();
+    addJoinToQuery(candidates[index]);
 }
 
 void MainWindow::addConditionStep()
@@ -879,7 +909,6 @@ void MainWindow::onSqlModeToggled(bool checked)
         m_rightStack->setCurrentIndex(0);
         m_addStepBtn->setEnabled(true);
         refreshQueryPanel();
-        m_diagramView->setFocusTable(m_schema, m_focusTable);
     }
 }
 
@@ -896,50 +925,123 @@ void MainWindow::onExecuteClicked()
 
 void MainWindow::onSqlTextChanged()
 {
-    if (!m_sqlModeActive) {
-        return;
+    if (m_sqlModeActive) {
+        refreshDiagram();
     }
+}
 
+QVector<QString> MainWindow::sqlQueryTables() const
+{
     const QString sql = m_sqlEditor->toPlainText();
 
-    // Crude but effective: pull the table right after FROM and every
-    // table right after JOIN, so the diagram tracks whatever the person
-    // is typing without needing a full SQL parser.
+    // Crude but effective: the table right after FROM and every table
+    // right after JOIN, so the diagram tracks whatever is being typed
+    // without needing a full SQL parser.
     static const QRegularExpression fromPattern(R"(\bFROM\s+([A-Za-z_][A-Za-z0-9_]*))",
                                                   QRegularExpression::CaseInsensitiveOption);
     static const QRegularExpression joinPattern(R"(\bJOIN\s+([A-Za-z_][A-Za-z0-9_]*))",
                                                   QRegularExpression::CaseInsensitiveOption);
 
+    QVector<QString> tables;
     const auto fromMatch = fromPattern.match(sql);
     if (!fromMatch.hasMatch()) {
-        return;
+        return tables;
     }
-
     const QString fromTable = resolveTableName(fromMatch.captured(1));
     if (fromTable.isEmpty()) {
-        return;
+        return tables;
     }
+    tables.push_back(fromTable);
 
-    // Tables explicitly typed after JOIN...
-    QVector<QString> relatedTables;
     auto matches = joinPattern.globalMatch(sql);
     while (matches.hasNext()) {
         const QString joinTable = resolveTableName(matches.next().captured(1));
-        if (!joinTable.isEmpty() && joinTable != fromTable && !relatedTables.contains(joinTable)) {
-            relatedTables.push_back(joinTable);
+        if (!joinTable.isEmpty() && !tables.contains(joinTable)) {
+            tables.push_back(joinTable);
+        }
+    }
+    return tables;
+}
+
+QVector<QString> MainWindow::currentQueryTables() const
+{
+    return m_sqlModeActive ? sqlQueryTables() : m_queryModel.involvedTables();
+}
+
+void MainWindow::refreshDiagram()
+{
+    QVector<QString> tables;
+    QVector<ForeignKey> joined;
+
+    if (m_sqlModeActive) {
+        tables = sqlQueryTables();
+        // Typed SQL has no model behind it, so a solid line is drawn for
+        // every foreign key that links two tables named in the query.
+        for (const auto& fk : m_schema.foreignKeys()) {
+            if (tables.contains(fk.fromTable) && tables.contains(fk.toTable)) {
+                joined.push_back(fk);
+            }
+        }
+    } else {
+        tables = m_queryModel.involvedTables();
+        for (const auto& join : m_queryModel.joins()) {
+            joined.push_back(join.onRelation);
         }
     }
 
-    // ...plus the focus table's own known foreign-key relations, so the
-    // diagram also shows what it CAN join to, not only what's typed yet.
-    for (const auto& fk : m_schema.relationsFor(fromTable)) {
-        const QString other = (fk.fromTable == fromTable) ? fk.toTable : fk.fromTable;
-        if (other != fromTable && !relatedTables.contains(other)) {
-            relatedTables.push_back(other);
+    if (tables.isEmpty()) {
+        // SQL mode: keep showing the last diagram while the person is
+        // mid-edit (e.g. FROM not typed yet) rather than flickering empty.
+        if (!m_sqlModeActive) {
+            m_diagramView->clear();
         }
+        return;
     }
 
-    m_diagramView->setTablesFromNames(m_schema, fromTable, relatedTables);
+    m_diagramView->setQueryGraph(tables, joined, m_schema.joinCandidates(tables));
+}
+
+void MainWindow::insertJoinIntoSql(const JoinCandidate& candidate)
+{
+    const QString text = m_sqlEditor->toPlainText();
+
+    static const QRegularExpression fromPattern(R"(\bFROM\b)", QRegularExpression::CaseInsensitiveOption);
+    // The FROM/JOIN section ends at the first of these (or the end of text).
+    static const QRegularExpression sectionEnd(
+        R"(\b(WHERE|GROUP\s+BY|HAVING|ORDER\s+BY|LIMIT|UNION|INTERSECT|EXCEPT)\b|;)",
+        QRegularExpression::CaseInsensitiveOption);
+
+    const auto fromMatch = fromPattern.match(text);
+    if (!fromMatch.hasMatch()) {
+        return;
+    }
+    const auto endMatch = sectionEnd.match(text, fromMatch.capturedEnd());
+    const int sectionEndPos = endMatch.hasMatch() ? int(endMatch.capturedStart()) : int(text.size());
+
+    // Land right after the last clause, not after the blank space before WHERE.
+    int pos = sectionEndPos;
+    while (pos > 0 && text.at(pos - 1).isSpace()) {
+        --pos;
+    }
+
+    const auto& fk = candidate.relation;
+    QString clause = "\nJOIN " + candidate.table + "\n  ON " + fk.fromTable + "." + fk.fromColumn
+                   + " = " + fk.toTable + "." + fk.toColumn;
+
+    // If another clause follows on the same line ("... FROM a WHERE ..."),
+    // move it onto its own line so the result reads like generated SQL.
+    // Otherwise leave the person's own whitespace exactly as it was.
+    int replaceEnd = pos;
+    if (endMatch.hasMatch() && sectionEndPos > pos && !text.mid(pos, sectionEndPos - pos).contains('\n')) {
+        clause += "\n";
+        replaceEnd = sectionEndPos;
+    }
+
+    // Through a cursor on the document, so Ctrl+Z undoes just this JOIN.
+    QTextCursor cursor(m_sqlEditor->document());
+    cursor.setPosition(pos);
+    cursor.setPosition(replaceEnd, QTextCursor::KeepAnchor);
+    cursor.insertText(clause);
 }
 
 QString MainWindow::resolveTableName(const QString& rawName) const
@@ -1244,20 +1346,32 @@ void MainWindow::reloadSchemaAndFocus()
 
     syncSchemaUi();
 
-    // Keep the current focus table if it's still around; otherwise fall
-    // back to whatever the schema's new default is (which may be empty,
-    // e.g. the last table was just dropped, or nothing was imported).
-    if (!m_schema.findTable(m_focusTable)) {
-        m_focusTable.clear();
+    // Keep the query being built if everything it refers to still exists
+    // (tables, and the foreign keys its JOINs rely on). Otherwise fall
+    // back to the schema's default table.
+    bool queryStillValid = !m_queryModel.isEmpty() && m_schema.findTable(m_queryModel.fromTable());
+    if (queryStillValid) {
+        for (const auto& join : m_queryModel.joins()) {
+            if (!m_schema.findTable(join.table) || !m_schema.foreignKeys().contains(join.onRelation)) {
+                queryStillValid = false;
+                break;
+            }
+        }
     }
-    const QString target = !m_focusTable.isEmpty() ? m_focusTable : defaultFocusTable();
 
+    if (queryStillValid) {
+        refreshQueryPanel();
+        return;
+    }
+
+    m_focusTable.clear();
+    const QString target = defaultFocusTable();
     if (target.isEmpty()) {
         m_diagramView->clear();
         m_queryModel = QueryModel();
         refreshQueryPanel();
     } else {
-        focusTable(target);
+        startQueryFrom(target);
     }
 }
 

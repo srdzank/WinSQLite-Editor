@@ -5,13 +5,21 @@
 #include <QString>
 #include <QVector>
 
-#include "Schema.h"
+#include "ForeignKey.h"
+#include "JoinCandidate.h"
 
-// Renders a focus-based diagram: the focused table sits in the center,
-// its direct relations (from Schema::relationsFor) are placed around it
-// in a cross layout. Clicking any visible table emits tableClicked, which
-// MainWindow uses to re-focus the diagram - this is the "spanning tree
-// around the active table" behaviour discussed for phase 2.
+// Draws the query that is being built, and what can be added to it next:
+//
+//   * the tables already in the query sit in a row in the middle (the
+//     FROM table first), connected by solid lines for each JOIN;
+//   * every table that could still be joined (it has a foreign key to a
+//     table in the query) is drawn below as a dashed "+ table" node with
+//     dashed lines to the table(s) it connects to. Clicking such a node
+//     emits joinCandidateClicked().
+//
+// The view is a pure renderer: it never changes the query itself. The
+// owner reacts to joinCandidateClicked() by extending the query and then
+// calls setQueryGraph() again, so the diagram and the query can't drift.
 class DiagramView : public QGraphicsView
 {
     Q_OBJECT
@@ -19,30 +27,27 @@ class DiagramView : public QGraphicsView
 public:
     explicit DiagramView(QWidget* parent = nullptr);
 
-    // Redraws the diagram centered on focusTable, using relations from schema.
-    void setFocusTable(const Schema& schema, const QString& focusTable);
+    // queryTables      tables already in the query; the first is the FROM table.
+    // joinedRelations  foreign keys that connect tables inside the query
+    //                  (drawn as solid lines).
+    // candidates       what could be joined next (drawn dashed).
+    void setQueryGraph(const QVector<QString>& queryTables,
+                       const QVector<ForeignKey>& joinedRelations,
+                       const QVector<JoinCandidate>& candidates);
 
-    // Empties the diagram - used when no table is focused (e.g. right
-    // after a new/empty database is opened, or the focused table itself
-    // was just dropped).
+    // Empties the diagram (no database open, or no table chosen yet).
     void clear();
 
-    // Redraws the diagram centered on focusTable, but with the related
-    // tables supplied explicitly rather than looked up via Schema::
-    // relationsFor. Used to drive the diagram from raw, manually-typed
-    // SQL (FROM/JOIN table names) so typing keeps the visual in sync.
-    // A solid accent line is drawn when a real foreign key connects the
-    // pair; a dashed line otherwise (e.g. a JOIN typed without a known
-    // relation).
-    void setTablesFromNames(const Schema& schema, const QString& focusTable,
-                             const QVector<QString>& relatedTables);
-
 signals:
-    void tableClicked(const QString& tableName);
+    // A dashed candidate node was clicked.
+    void joinCandidateClicked(const QString& tableName);
 
 protected:
     void mousePressEvent(QMouseEvent* event) override;
+    void resizeEvent(QResizeEvent* event) override;
 
 private:
+    void fitScene();
+
     QGraphicsScene m_scene;
 };

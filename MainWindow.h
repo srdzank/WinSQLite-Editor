@@ -42,6 +42,10 @@ private slots:
     void onTableActivated(const QString& tableName);
     void onTreeItemClicked(QTreeWidgetItem* item, int column);
 
+    // A dashed "+ table" node in the diagram was clicked: extend the
+    // current query with a JOIN to it (never rebuilds the query).
+    void onJoinCandidateClicked(const QString& tableName);
+
     // Query builder step management.
     void onAddStepClicked();
     void onRemoveJoinClicked(int index);
@@ -129,11 +133,27 @@ private:
     // table with at least one relation, else just the first table, else
     // empty if the schema has no tables at all.
     QString defaultFocusTable() const;
-    // Re-centers the diagram on tableName and rebuilds the query model
-    // from scratch (FROM = tableName, JOIN = its first relation, if any).
-    // No-ops if tableName is already focused. Unlike onTableActivated(),
-    // this ignores SQL mode - it's for schema refreshes, not table clicks.
-    void focusTable(const QString& tableName);
+    // Starts a NEW query: FROM = tableName, nothing else. Joins are then
+    // added one at a time (diagram click or "+ Add step"). Only called for
+    // explicit "start from this table" actions - clicking in the diagram
+    // never goes through here, so it can't wipe a query in progress.
+    void startQueryFrom(const QString& tableName);
+
+    // Redraws the diagram from whatever the query currently is: the
+    // builder model, or - in SQL mode - the tables found in the typed SQL.
+    // Everything that changes the query ends up here, so the diagram can't
+    // show something the query doesn't contain.
+    void refreshDiagram();
+
+    // Tables in the query right now (FROM first), in whichever mode is active.
+    QVector<QString> currentQueryTables() const;
+    // Tables found in the raw SQL text: the one after FROM, then each JOIN.
+    QVector<QString> sqlQueryTables() const;
+    // Adds candidate to the query: a model change in builder mode, a text
+    // insertion (before WHERE/GROUP BY/...) in SQL mode - either way the
+    // existing query is extended, not replaced.
+    void addJoinToQuery(const JoinCandidate& candidate);
+    void insertJoinIntoSql(const JoinCandidate& candidate);
     void resetUiForNewDatabase();
 
     // Case-insensitively resolves a table name as typed in raw SQL to its

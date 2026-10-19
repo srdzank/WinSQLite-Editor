@@ -88,6 +88,23 @@ bool Schema::load(QSqlDatabase& db)
         m_tables.push_back(table);
     }
 
+    // "REFERENCES other" without a column list leaves PRAGMA's "to" empty,
+    // meaning "the primary key of other". Resolve it here so every
+    // consumer (JOIN ... ON ...) gets a usable column name.
+    for (auto& fk : m_foreignKeys) {
+        if (!fk.toColumn.isEmpty()) {
+            continue;
+        }
+        if (const Table* target = findTable(fk.toTable)) {
+            for (const auto& col : target->columns) {
+                if (col.isPrimaryKey) {
+                    fk.toColumn = col.name;
+                    break;
+                }
+            }
+        }
+    }
+
     return true;
 }
 
@@ -119,6 +136,31 @@ QVector<Index> Schema::indexesFor(const QString& tableName) const
         if (index.table == tableName) {
             result.push_back(index);
         }
+    }
+    return result;
+}
+
+QVector<JoinCandidate> Schema::joinCandidates(const QVector<QString>& queryTables) const
+{
+    QVector<JoinCandidate> result;
+    for (const auto& fk : m_foreignKeys) {
+        if (fk.fromTable == fk.toTable) {
+            continue;  // self-references would need aliases
+        }
+        const bool fromInQuery = queryTables.contains(fk.fromTable);
+        const bool toInQuery = queryTables.contains(fk.toTable);
+        if (fromInQuery == toInQuery) {
+            continue;  // both already joined, or unrelated to the query
+        }
+
+        JoinCandidate candidate;
+        candidate.relation = fk;
+        candidate.table = fromInQuery ? fk.toTable : fk.fromTable;
+        candidate.anchorTable = fromInQuery ? fk.fromTable : fk.toTable;
+        if (!findTable(candidate.table)) {
+            continue;  // FK pointing at a table that doesn't exist
+        }
+        result.push_back(candidate);
     }
     return result;
 }

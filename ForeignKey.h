@@ -10,4 +10,10 @@ struct ForeignKey
     QString fromColumn;
     QString toTable;
     QString toColumn;
+
+    bool operator==(const ForeignKey& other) const
+    {
+        return fromTable == other.fromTable && fromColumn == other.fromColumn
+            && toTable == other.toTable && toColumn == other.toColumn;
+    }
 };

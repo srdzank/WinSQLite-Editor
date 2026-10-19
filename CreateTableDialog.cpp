@@ -3,11 +3,13 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDialogButtonBox>
+#include <QAbstractItemView>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
@@ -28,15 +30,41 @@ enum ColumnIndex { NameColumn, TypeColumn, PrimaryKeyColumn, NotNullColumn, Colu
 
 // PK/NOT NULL cells hold a centered checkbox rather than a plain
 // checkable item, so it lines up visually with the combo box column.
+// Clicking anywhere in the cell toggles it - the box itself is only ~16px,
+// which made it easy to click "next to" it and see nothing happen.
+class CheckCell : public QWidget
+{
+public:
+    CheckCell()
+    {
+        m_box = new QCheckBox(this);
+        auto* checkLayout = new QHBoxLayout(this);
+        checkLayout->addWidget(m_box);
+        checkLayout->setAlignment(Qt::AlignCenter);
+        checkLayout->setContentsMargins(0, 0, 0, 0);
+        setCursor(Qt::PointingHandCursor);
+    }
+
+    QCheckBox* checkBox() const { return m_box; }
+
+protected:
+    // Only reached when the click missed the checkbox's own hit area (a
+    // click on the box is handled by the box itself), so no double toggle.
+    void mouseReleaseEvent(QMouseEvent* event) override
+    {
+        if (event->button() == Qt::LeftButton && rect().contains(event->pos())) {
+            m_box->toggle();
+        }
+        QWidget::mouseReleaseEvent(event);
+    }
+
+private:
+    QCheckBox* m_box = nullptr;
+};
+
 QWidget* centeredCheckBox()
 {
-    auto* container = new QWidget();
-    auto* checkBox = new QCheckBox(container);
-    auto* checkLayout = new QHBoxLayout(container);
-    checkLayout->addWidget(checkBox);
-    checkLayout->setAlignment(Qt::AlignCenter);
-    checkLayout->setContentsMargins(0, 0, 0, 0);
-    return container;
+    return new CheckCell();
 }
 
 } // namespace
@@ -63,6 +91,20 @@ CreateTableDialog::CreateTableDialog(QWidget* parent)
     m_columnsTable->horizontalHeader()->setSectionResizeMode(PrimaryKeyColumn, QHeaderView::ResizeToContents);
     m_columnsTable->horizontalHeader()->setSectionResizeMode(NotNullColumn, QHeaderView::ResizeToContents);
     m_columnsTable->verticalHeader()->setVisible(false);
+    // A single click on a name cell selects it AND opens it for typing,
+    // so there's no separate "double-click to edit" step to discover.
+    m_columnsTable->setEditTriggers(QAbstractItemView::AllEditTriggers);
+    m_columnsTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    // Explicit colours for the selected cell and the in-cell editor. Without
+    // them the selection used a default blue that clashed with the theme,
+    // and the editor was a bare caret on the same colour as the background,
+    // so it was hard to tell which cell you were typing into.
+    m_columnsTable->setStyleSheet(
+        "QTableWidget::item:selected { background-color: #0C447C; color: #E6F1FB; }"
+        "QTableWidget QLineEdit {"
+        "  background-color: #201F22; color: #F1EFE8;"
+        "  border: 1px solid #378ADD; padding: 0px 4px;"
+        "}");
     layout->addWidget(m_columnsTable, 1);
 
     auto* rowButtons = new QHBoxLayout();
@@ -77,7 +119,13 @@ CreateTableDialog::CreateTableDialog(QWidget* parent)
     buttons->button(QDialogButtonBox::Ok)->setText("Create");
     layout->addWidget(buttons);
 
-    connect(addRowBtn, &QPushButton::clicked, this, &CreateTableDialog::addColumnRow);
+    // "+ Add column" also drops the cursor into the new row's name cell.
+    connect(addRowBtn, &QPushButton::clicked, this, [this]() {
+        addColumnRow();
+        const int row = m_columnsTable->rowCount() - 1;
+        m_columnsTable->setCurrentCell(row, NameColumn);
+        m_columnsTable->editItem(m_columnsTable->item(row, NameColumn));
+    });
     connect(removeRowBtn, &QPushButton::clicked, this, &CreateTableDialog::removeSelectedRow);
     connect(buttons, &QDialogButtonBox::accepted, this, &CreateTableDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &CreateTableDialog::reject);
@@ -129,6 +177,11 @@ QVector<CreateTableDialog::ColumnDef> CreateTableDialog::columns() const
 
 void CreateTableDialog::accept()
 {
+    // A name cell that is still being edited hasn't written its text to the
+    // item yet. Taking focus away from the editor commits it, so the last
+    // typed name is never lost when "Create" is pressed.
+    m_columnsTable->setFocus();
+
     if (!kIdentifierPattern.match(tableName()).hasMatch()) {
         QMessageBox::warning(this, "New Table",
                               "Table name must start with a letter or underscore, and contain only "

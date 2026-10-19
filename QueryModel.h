@@ -33,14 +33,18 @@ public:
 
     void addJoin(const QString& table, const ForeignKey& relation)
     {
+        if (involvedTables().contains(table)) {
+            return;  // never join the same table twice
+        }
         m_joins.push_back({table, relation});
     }
-    void removeJoin(int index)
-    {
-        if (index >= 0 && index < m_joins.size()) {
-            m_joins.remove(index);
-        }
-    }
+
+    // Removes the join at index, plus everything that depended on it:
+    // joins that hang off the removed table (and so on, transitively) and
+    // WHERE conditions on any removed table. Without the cascade, removing
+    // a middle join would leave the SQL referencing a table that is no
+    // longer in the query.
+    void removeJoin(int index);
     const QVector<JoinClause>& joins() const { return m_joins; }
 
     void addCondition(const Condition& condition) { m_conditions.push_back(condition); }

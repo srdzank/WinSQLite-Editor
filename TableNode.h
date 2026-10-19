@@ -12,10 +12,23 @@ public:
     static constexpr qreal kWidth = 110.0;
     static constexpr qreal kHeight = 44.0;
 
-    // isFocus draws the node with the accent (teal) style used for the
-    // table currently centered in the diagram; other nodes get the
-    // neutral gray style.
-    TableNode(const QString& tableName, bool isFocus, QGraphicsItem* parent = nullptr);
+    enum Style {
+        Base,       // the FROM table: solid teal, bold
+        Joined,     // a table already JOINed into the query: teal outline
+        Candidate,  // a table that could be joined next: dashed, clickable
+    };
+
+    TableNode(const QString& tableName, Style style, QGraphicsItem* parent = nullptr);
 
     QString tableName() const;
+    Style style() const { return m_style; }
+
+protected:
+    void hoverEnterEvent(QGraphicsSceneHoverEvent* event) override;
+    void hoverLeaveEvent(QGraphicsSceneHoverEvent* event) override;
+
+private:
+    void applyColors(bool hovered);
+
+    Style m_style;
 };

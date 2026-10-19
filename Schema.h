@@ -6,6 +6,7 @@
 
 #include "ForeignKey.h"
 #include "Index.h"
+#include "JoinCandidate.h"
 #include "Table.h"
 
 // Loads and holds the full schema (tables, columns, foreign keys, and
@@ -28,6 +29,12 @@ public:
     // Returns foreign keys where fromTable or toTable matches tableName.
     // Used by the focus-based diagram to find a table's direct neighbours.
     QVector<ForeignKey> relationsFor(const QString& tableName) const;
+
+    // Returns every table that could be JOINed to a query that already
+    // contains queryTables: one entry per foreign key that links a table
+    // inside the query to a table outside it. A table with several
+    // foreign keys into the query appears once per key.
+    QVector<JoinCandidate> joinCandidates(const QVector<QString>& queryTables) const;
 
     // Returns user-created indexes defined on tableName.
     QVector<Index> indexesFor(const QString& tableName) const;
