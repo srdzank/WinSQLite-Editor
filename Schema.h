@@ -41,7 +41,12 @@ public:
 
     QString errorMessage() const { return m_errorMessage; }
 
+    // True if the database contains sqlite-vec (vec0) virtual tables. They are
+    // deliberately left out of tables(): Qt's bundled SQLite cannot inspect them.
+    bool hasVectorTables() const { return m_hasVectorTables; }
+
 private:
+    bool m_hasVectorTables = false;
     QVector<Table> m_tables;
     QVector<ForeignKey> m_foreignKeys;
     QVector<Index> m_indexes;

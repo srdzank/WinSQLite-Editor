@@ -1,4 +1,5 @@
 #include "MainWindow.h"
+#include "VectorSupport.h"
 
 #include <functional>
 
@@ -416,6 +417,10 @@ void MainWindow::buildMenus()
                         exportDbAction, exportResultsAction, importDbAction};
     setSchemaActionsEnabled(false);
 
+    // Tools > Vector space (3D)... / Create demo vector database... (sqlite-vec).
+    // Independent of the main connection: it opens its own vec-enabled connection.
+    vec::installVectorExplorer(this, [this] { return m_db.databaseName(); });
+
     // Settings is independent of whether a database is open, so its
     // action is never added to m_schemaActions / disabled above.
     auto* settingsMenu = menuBar()->addMenu("&Settings");
@@ -516,14 +521,17 @@ bool MainWindow::openDatabase(const QString& path)
         QSqlDatabase::removeDatabase(connectionName);
     }
     resetUiForNewDatabase();
+    m_lastOpenError.clear();
 
     m_db = QSqlDatabase::addDatabase("QSQLITE", "main_gui_connection");
     m_db.setDatabaseName(path);
     if (!m_db.open()) {
+        m_lastOpenError = m_db.lastError().text();
         return false;
     }
 
     if (!m_schema.load(m_db)) {
+        m_lastOpenError = m_schema.errorMessage();
         return false;
     }
 
@@ -539,6 +547,10 @@ bool MainWindow::openDatabase(const QString& path)
     const QString initialFocus = defaultFocusTable();
     if (!initialFocus.isEmpty()) {
         startQueryFrom(initialFocus);
+    }
+
+    if (m_schema.hasVectorTables()) {
+        m_statusLabel->setText("Vector tables (vec0) found - explore them via Tools > Vector space (3D)...");
     }
 
     return true;
@@ -1310,7 +1322,11 @@ void MainWindow::onOpenDatabaseTriggered()
     rememberDialogDir(path);
 
     if (!openDatabase(path)) {
-        QMessageBox::critical(this, "Error", "Unable to open or load the database.");
+        QString message = "Unable to open or load the database.";
+        if (!m_lastOpenError.isEmpty()) {
+            message += "\n\n" + m_lastOpenError;
+        }
+        QMessageBox::critical(this, "Error", message);
     }
 }
 

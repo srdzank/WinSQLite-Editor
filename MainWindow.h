@@ -179,6 +179,8 @@ private:
     QueryModel m_queryModel;
     QString m_focusTable;
     QSqlDatabase m_db;
+    // Reason openDatabase() last returned false (shown in the error dialog).
+    QString m_lastOpenError;
 
     // Preferences edited via the Settings dialog, loaded from/saved to
     // QSettings. m_uiFontSize/m_editorFontSize feed applyDarkTheme()'s

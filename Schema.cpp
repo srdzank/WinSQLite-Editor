@@ -9,6 +9,39 @@ bool Schema::load(QSqlDatabase& db)
     m_foreignKeys.clear();
     m_indexes.clear();
     m_errorMessage.clear();
+    m_hasVectorTables = false;
+
+    // sqlite-vec (vec0) virtual tables cannot be inspected through Qt's bundled
+    // SQLite (the vec0 module is not loaded there, so PRAGMA table_info fails with
+    // "no such module: vec0"). Hide them and their shadow tables from the schema;
+    // they are explored via Tools > Vector space (3D) instead.
+    QStringList vecTables;
+    {
+        QSqlQuery vecQuery(db);
+        if (vecQuery.exec(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND sql LIKE 'CREATE VIRTUAL TABLE%' "
+                "AND lower(sql) LIKE '%using vec0%';")) {
+            while (vecQuery.next()) {
+                vecTables << vecQuery.value(0).toString();
+            }
+        }
+    }
+    m_hasVectorTables = !vecTables.isEmpty();
+    static const QStringList kVecShadowSuffixes = {"_chunks", "_rowids", "_vector_chunks", "_info", "_auxiliary"};
+    const auto isVecObject = [&vecTables](const QString& name) {
+        for (const QString& vt : vecTables) {
+            if (name == vt) {
+                return true;
+            }
+            for (const QString& suffix : kVecShadowSuffixes) {
+                if (name.startsWith(vt + suffix)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
 
     QSqlQuery tableListQuery(db);
     if (!tableListQuery.exec(
@@ -22,6 +55,9 @@ bool Schema::load(QSqlDatabase& db)
     while (tableListQuery.next()) {
         Table table;
         table.name = tableListQuery.value(0).toString();
+        if (isVecObject(table.name)) {
+            continue;
+        }
 
         // PRAGMA statements can't be parameterised, so we build the string
         // directly. Table names come from sqlite_master, not user input,
