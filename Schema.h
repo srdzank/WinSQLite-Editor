@@ -51,7 +51,17 @@ public:
     // table list shows them from here, read-only.
     const QVector<Table>& vectorTables() const { return m_vectorTables; }
 
+    // True if tableName is one of the vec0 tables above.
+    bool isVectorTable(const QString& tableName) const;
+    // Finds a regular table OR a vec0 table by exact name.
+    const Table* findAnyTable(const QString& tableName) const;
+
 private:
+    // Adds a synthetic foreign key vec_X.id -> X.id for every vec0 table whose
+    // name points at a regular table (vec_documents -> documents), so the
+    // diagram can offer the pair for JOIN. vec0 tables declare no real FKs.
+    void addVectorRelations();
+
     bool m_hasVectorTables = false;
     QVector<Table> m_vectorTables;
     QVector<Table> m_tables;

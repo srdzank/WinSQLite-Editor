@@ -224,7 +224,94 @@ bool Schema::load(QSqlDatabase& db)
         }
     }
 
+    addVectorRelations();
     return true;
+}
+
+bool Schema::isVectorTable(const QString& tableName) const
+{
+    for (const auto& t : m_vectorTables) {
+        if (t.name == tableName) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const Table* Schema::findAnyTable(const QString& tableName) const
+{
+    if (const Table* t = findTable(tableName)) {
+        return t;
+    }
+    for (const auto& t : m_vectorTables) {
+        if (t.name == tableName) {
+            return &t;
+        }
+    }
+    return nullptr;
+}
+
+void Schema::addVectorRelations()
+{
+    static const QStringList kPrefixes = {"vec_", "vss_", "embeddings_", "embedding_", "vec"};
+    static const QStringList kSuffixes = {"_vec", "_vectors", "_embeddings", "_embedding", "_emb"};
+
+    for (const auto& vt : m_vectorTables) {
+        QString vecPk;
+        for (const auto& col : vt.columns) {
+            if (col.isPrimaryKey) {
+                vecPk = col.name;
+                break;
+            }
+        }
+        if (vecPk.isEmpty()) {
+            vecPk = QStringLiteral("rowid");
+        }
+
+        // Candidate base-table names: the vec table's name with a known
+        // prefix/suffix removed.
+        QStringList bases;
+        for (const QString& p : kPrefixes) {
+            if (vt.name.startsWith(p, Qt::CaseInsensitive) && vt.name.size() > p.size()) {
+                bases << vt.name.mid(p.size());
+            }
+        }
+        for (const QString& s : kSuffixes) {
+            if (vt.name.endsWith(s, Qt::CaseInsensitive) && vt.name.size() > s.size()) {
+                bases << vt.name.left(vt.name.size() - s.size());
+            }
+        }
+
+        for (const QString& base : bases) {
+            const Table* target = nullptr;
+            for (const auto& t : m_tables) {
+                if (t.name.compare(base, Qt::CaseInsensitive) == 0) {
+                    target = &t;
+                    break;
+                }
+            }
+            if (!target) {
+                continue;
+            }
+            QString toColumn;
+            for (const auto& col : target->columns) {
+                if (col.isPrimaryKey) {
+                    toColumn = col.name;
+                    break;
+                }
+            }
+            if (toColumn.isEmpty()) {
+                continue;
+            }
+            ForeignKey fk;
+            fk.fromTable = vt.name;
+            fk.fromColumn = vecPk;
+            fk.toTable = target->name;
+            fk.toColumn = toColumn;
+            m_foreignKeys.push_back(fk);
+            break;
+        }
+    }
 }
 
 const Table* Schema::findTable(const QString& tableName) const
@@ -276,7 +363,7 @@ QVector<JoinCandidate> Schema::joinCandidates(const QVector<QString>& queryTable
         candidate.relation = fk;
         candidate.table = fromInQuery ? fk.toTable : fk.fromTable;
         candidate.anchorTable = fromInQuery ? fk.fromTable : fk.toTable;
-        if (!findTable(candidate.table)) {
+        if (!findAnyTable(candidate.table)) {
             continue;  // FK pointing at a table that doesn't exist
         }
         result.push_back(candidate);

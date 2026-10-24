@@ -2,6 +2,7 @@
 
 #include <QGraphicsScene>
 #include <QGraphicsView>
+#include <QSet>
 #include <QString>
 #include <QVector>
 
@@ -12,6 +13,7 @@
 //
 //   * the tables already in the query sit in a row in the middle (the
 //     FROM table first), connected by solid lines for each JOIN;
+//   * vec0 (vector) tables get their own colour (see vectorTables);
 //   * every table that could still be joined (it has a foreign key to a
 //     table in the query) is drawn below as a dashed "+ table" node with
 //     dashed lines to the table(s) it connects to. Clicking such a node
@@ -33,7 +35,8 @@ public:
     // candidates       what could be joined next (drawn dashed).
     void setQueryGraph(const QVector<QString>& queryTables,
                        const QVector<ForeignKey>& joinedRelations,
-                       const QVector<JoinCandidate>& candidates);
+                       const QVector<JoinCandidate>& candidates,
+                       const QSet<QString>& vectorTables = {});
 
     // Empties the diagram (no database open, or no table chosen yet).
     void clear();

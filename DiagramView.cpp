@@ -2,6 +2,7 @@
 
 #include <algorithm>
 
+#include <QGraphicsColorizeEffect>
 #include <QGraphicsPathItem>
 #include <QHash>
 #include <QMetaObject>
@@ -49,7 +50,8 @@ void DiagramView::clear()
 
 void DiagramView::setQueryGraph(const QVector<QString>& queryTables,
                                 const QVector<ForeignKey>& joinedRelations,
-                                const QVector<JoinCandidate>& candidates)
+                                const QVector<JoinCandidate>& candidates,
+                                const QSet<QString>& vectorTables)
 {
     m_scene.clear();
     if (queryTables.isEmpty()) {
@@ -164,10 +166,17 @@ void DiagramView::setQueryGraph(const QVector<QString>& queryTables,
     }
 
     // ---- Nodes ---------------------------------------------------------
-    auto addNode = [this, &centers](const QString& name, TableNode::Style style) {
+    auto addNode = [this, &centers, &vectorTables](const QString& name, TableNode::Style style) {
         auto* node = new TableNode(name, style);
         const QPointF c = centers.value(name);
         node->setPos(c.x() - TableNode::kWidth / 2.0, c.y() - TableNode::kHeight / 2.0);
+        if (vectorTables.contains(name)) {
+            // vec0 tables: tint the whole node purple so they stand apart.
+            auto* tint = new QGraphicsColorizeEffect;
+            tint->setColor(QColor("#7F77DD"));
+            tint->setStrength(0.75);
+            node->setGraphicsEffect(tint);
+        }
         m_scene.addItem(node);
         return node;
     };

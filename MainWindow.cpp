@@ -1172,13 +1172,36 @@ void MainWindow::addConditionStep()
     const QVector<QString> involved = m_queryModel.involvedTables();
     QStringList columnLabels;
 
+    // Vector columns (vec0 "float[N]" etc.) can't be compared with =, <, LIKE.
+    // They get one special entry instead: a nearest-neighbour condition.
+    struct VecChoice { QString table; QString column; QString pk; };
+    QHash<QString, VecChoice> vecChoices;
+    const auto isVectorType = [](const QString& type) {
+        const QString t = type.trimmed().toLower();
+        return t.startsWith("float[") || t.startsWith("int8[") || t.startsWith("bit[");
+    };
+
     for (const auto& tableName : involved) {
-        const Table* table = m_schema.findTable(tableName);
+        const Table* table = m_schema.findAnyTable(tableName);
         if (!table) {
             continue;
         }
+        const bool isVecTable = m_schema.isVectorTable(tableName);
+        QString pk = "rowid";
         for (const auto& col : table->columns) {
-            columnLabels << (tableName + "." + col.name);
+            if (col.isPrimaryKey) {
+                pk = col.name;
+                break;
+            }
+        }
+        for (const auto& col : table->columns) {
+            if (isVecTable && isVectorType(col.type)) {
+                const QString label = tableName + "." + col.name + "  (nearest neighbours)";
+                vecChoices.insert(label, {tableName, col.name, pk});
+                columnLabels << label;
+            } else {
+                columnLabels << (tableName + "." + col.name);
+            }
         }
     }
 
@@ -1192,6 +1215,29 @@ void MainWindow::addConditionStep()
     const QString column = QInputDialog::getItem(this, "New condition",
                                                    "Column:", columnLabels, 0, false, &ok);
     if (!ok) {
+        return;
+    }
+
+    if (vecChoices.contains(column)) {
+        const VecChoice vc = vecChoices.value(column);
+        const int srcId = QInputDialog::getInt(this, "Nearest neighbours",
+                                               QString("Find rows most similar to %1.%2 =").arg(vc.table, vc.pk),
+                                               1, -2147483647, 2147483647, 1, &ok);
+        if (!ok) {
+            return;
+        }
+        const int k = QInputDialog::getInt(this, "Nearest neighbours", "How many neighbours (k):",
+                                           5, 1, 10000, 1, &ok);
+        if (!ok) {
+            return;
+        }
+        Condition vecCondition;
+        vecCondition.column = vc.table + "." + vc.column;
+        vecCondition.op = "MATCH";
+        vecCondition.value = QString("(SELECT %1 FROM %2 WHERE %3 = %4)\n  AND k = %5")
+                                 .arg(vc.column, vc.table, vc.pk).arg(srcId).arg(k);
+        m_queryModel.addCondition(vecCondition);
+        refreshQueryPanel();
         return;
     }
 
@@ -1335,7 +1381,11 @@ void MainWindow::refreshDiagram()
         return;
     }
 
-    m_diagramView->setQueryGraph(tables, joined, m_schema.joinCandidates(tables));
+    QSet<QString> vecNames;
+    for (const auto& vt : m_schema.vectorTables()) {
+        vecNames.insert(vt.name);
+    }
+    m_diagramView->setQueryGraph(tables, joined, m_schema.joinCandidates(tables), vecNames);
 }
 
 void MainWindow::insertJoinIntoSql(const JoinCandidate& candidate)
@@ -1384,6 +1434,11 @@ void MainWindow::insertJoinIntoSql(const JoinCandidate& candidate)
 QString MainWindow::resolveTableName(const QString& rawName) const
 {
     for (const auto& table : m_schema.tables()) {
+        if (table.name.compare(rawName, Qt::CaseInsensitive) == 0) {
+            return table.name;
+        }
+    }
+    for (const auto& table : m_schema.vectorTables()) {
         if (table.name.compare(rawName, Qt::CaseInsensitive) == 0) {
             return table.name;
         }
@@ -1760,10 +1815,10 @@ void MainWindow::reloadSchemaAndFocus()
     // Keep the query being built if everything it refers to still exists
     // (tables, and the foreign keys its JOINs rely on). Otherwise fall
     // back to the schema's default table.
-    bool queryStillValid = !m_queryModel.isEmpty() && m_schema.findTable(m_queryModel.fromTable());
+    bool queryStillValid = !m_queryModel.isEmpty() && m_schema.findAnyTable(m_queryModel.fromTable());
     if (queryStillValid) {
         for (const auto& join : m_queryModel.joins()) {
-            if (!m_schema.findTable(join.table) || !m_schema.foreignKeys().contains(join.onRelation)) {
+            if (!m_schema.findAnyTable(join.table) || !m_schema.foreignKeys().contains(join.onRelation)) {
                 queryStillValid = false;
                 break;
             }
