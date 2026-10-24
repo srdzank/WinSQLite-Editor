@@ -1,7 +1,10 @@
 #include "MainWindow.h"
+#include "VecDatabase.h"
+#include "VectorExplorerDialog.h"
 #include "VectorSupport.h"
 
 #include <functional>
+#include <memory>
 
 #include <QAction>
 #include <QColor>
@@ -12,6 +15,8 @@
 #include <QPoint>
 #include <QFont>
 #include <QHBoxLayout>
+#include <QHash>
+#include <QPair>
 #include <QHeaderView>
 #include <QInputDialog>
 #include <QJsonArray>
@@ -196,9 +201,13 @@ void MainWindow::buildUi()
     m_sqlModeBtn = new QPushButton("SQL mode", topBar);
     m_sqlModeBtn->setCheckable(true);
     m_sqlModeBtn->setEnabled(false);
+    m_view3dBtn = new QPushButton("3D view", topBar);
+    m_view3dBtn->setToolTip("Explore the sqlite-vec (vec0) vectors of this database in 3D");
+    m_view3dBtn->setEnabled(false);
     m_executeBtn = new QPushButton("Execute", topBar);
     m_executeBtn->setObjectName("primaryButton");
     m_executeBtn->setEnabled(false);
+    topLayout->addWidget(m_view3dBtn);
     topLayout->addWidget(m_sqlModeBtn);
     topLayout->addWidget(m_executeBtn);
     rootLayout->addWidget(topBar);
@@ -354,6 +363,29 @@ void MainWindow::buildUi()
     connect(m_addStepBtn, &QPushButton::clicked, this, &MainWindow::onAddStepClicked);
     connect(m_sqlModeBtn, &QPushButton::toggled, this, &MainWindow::onSqlModeToggled);
     connect(m_executeBtn, &QPushButton::clicked, this, &MainWindow::onExecuteClicked);
+    connect(m_view3dBtn, &QPushButton::clicked, this, &MainWindow::onView3dClicked);
+
+    // vec0 tables: double-click or right-click opens the 3D explorer.
+    connect(m_tableTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item, int) {
+        if (item && item->data(0, Qt::UserRole + 1).toBool()) {
+            QTreeWidgetItem* top = item->parent() ? item->parent() : item;
+            openVectorSpace(top->data(0, Qt::UserRole + 2).toString());
+        }
+    });
+    m_tableTree->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_tableTree, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
+        QTreeWidgetItem* item = m_tableTree->itemAt(pos);
+        if (!item || !item->data(0, Qt::UserRole + 1).toBool()) {
+            return;
+        }
+        QTreeWidgetItem* top = item->parent() ? item->parent() : item;
+        const QString name = top->data(0, Qt::UserRole + 2).toString();
+        QMenu menu(this);
+        QAction* open3d = menu.addAction(tr("Open 3D view"));
+        if (menu.exec(m_tableTree->viewport()->mapToGlobal(pos)) == open3d) {
+            openVectorSpace(name);
+        }
+    });
     connect(m_sqlEditor, &QPlainTextEdit::textChanged, this, &MainWindow::onSqlTextChanged);
     connect(m_resultsTable, &QTableWidget::itemChanged, this, &MainWindow::onResultCellEdited);
     connect(m_exportResultsBtn, &QPushButton::clicked, this, &MainWindow::onExportResultsTriggered);
@@ -573,11 +605,13 @@ void MainWindow::resetUiForNewDatabase()
     m_exportResultsBtn->setEnabled(false);
     m_statusLabel->clear();
     m_tableTree->clear();
+    m_view3dBtn->setEnabled(false);
 }
 
 void MainWindow::syncSchemaUi()
 {
     populateTableTree();
+    m_view3dBtn->setEnabled(m_schema.hasVectorTables());
 
     // Feed the raw-SQL autocomplete with every table and column name now
     // that the schema is known, on top of the built-in SQL keywords.
@@ -587,6 +621,19 @@ void MainWindow::syncSchemaUi()
         for (const auto& col : table.columns) {
             schemaWords << col.name;
         }
+    }
+    // vec0 tables aren't in tables() but are queryable in SQL mode, so
+    // offer them (and their columns) plus the common sqlite-vec functions
+    // in autocomplete too.
+    for (const auto& table : m_schema.vectorTables()) {
+        schemaWords << table.name;
+        for (const auto& col : table.columns) {
+            schemaWords << col.name;
+        }
+    }
+    if (m_schema.hasVectorTables()) {
+        schemaWords << "MATCH" << "distance" << "vec_version" << "vec_f32" << "vec_to_json"
+                    << "vec_length" << "vec_distance_L2" << "vec_distance_cosine";
     }
     m_sqlEditor->setSchemaWords(schemaWords);
 }
@@ -639,7 +686,259 @@ void MainWindow::populateTableTree()
         }
     }
 
+    // sqlite-vec (vec0) virtual tables. Qt's bundled SQLite has no vec0
+    // module, so they can't be queried or joined from here: they are listed
+    // (name + columns) but carry no UserRole table name, only the
+    // UserRole + 1 marker that onTreeItemClicked() looks for.
+    for (const auto& table : m_schema.vectorTables()) {
+        auto* tableItem = new QTreeWidgetItem(m_tableTree, {table.name + "  [vec0]"});
+        QFont boldFont = tableItem->font(0);
+        boldFont.setBold(true);
+        tableItem->setFont(0, boldFont);
+        tableItem->setForeground(0, QColor("#1D9E75"));
+        tableItem->setData(0, Qt::UserRole + 1, true);
+        tableItem->setData(0, Qt::UserRole + 2, table.name);  // real table name, for the click handler
+        tableItem->setToolTip(0, "Click: preview rows in SQL mode  |  Double-click or right-click: 3D view");
+
+        for (const auto& col : table.columns) {
+            QString label = col.name;
+            if (!col.type.isEmpty()) {
+                label += "  :  " + col.type;
+            }
+            if (col.isPrimaryKey) {
+                label += "  [PK]";
+            }
+            auto* colItem = new QTreeWidgetItem(tableItem, {label});
+            colItem->setData(0, Qt::UserRole + 1, true);
+            colItem->setForeground(0, QColor("#888780"));
+        }
+    }
+
     m_tableTree->collapseAll();
+}
+
+void MainWindow::onView3dClicked()
+{
+    const auto& vecTables = m_schema.vectorTables();
+    if (vecTables.isEmpty()) {
+        QMessageBox::information(this, "3D view", "This database has no sqlite-vec (vec0) tables.");
+        return;
+    }
+
+    // Which table: the one the last SQL result came from (so its rows light
+    // up in 3D), else the vec0 table selected in the list, else the only
+    // one, else ask.
+    QString name;
+    if (!m_lastResultRowids.isEmpty() && !m_lastResultVecTable.isEmpty()) {
+        name = m_lastResultVecTable;
+    }
+    if (name.isEmpty()) {
+        if (QTreeWidgetItem* current = m_tableTree->currentItem()) {
+            QTreeWidgetItem* top = current->parent() ? current->parent() : current;
+            if (top->data(0, Qt::UserRole + 1).toBool()) {
+                name = top->data(0, Qt::UserRole + 2).toString();
+            }
+        }
+    }
+    if (name.isEmpty()) {
+        if (vecTables.size() == 1) {
+            name = vecTables.first().name;
+        } else {
+            QStringList names;
+            for (const auto& table : vecTables) {
+                names << table.name;
+            }
+            bool ok = false;
+            name = QInputDialog::getItem(this, "3D view", "vec0 table:", names, 0, false, &ok);
+            if (!ok) {
+                return;
+            }
+        }
+    }
+    openVectorSpace(name);
+}
+
+void MainWindow::openVectorSpace(const QString& tableName)
+{
+    if (!m_db.isOpen() || tableName.isEmpty()) {
+        return;
+    }
+    if (!vec::Database::isValidIdentifier(tableName)) {
+        QMessageBox::warning(this, "3D view",
+                             "The 3D view only supports table names made of letters, digits and underscores.");
+        return;
+    }
+
+    // ---- Hover text for the points ------------------------------------
+    // Find the table that holds the text belonging to this vec0 table by
+    // name: vec_documents -> documents, message_embeddings -> messages, ...
+    QString baseName = tableName;
+    for (const QString& prefix : {QStringLiteral("vec0_"), QStringLiteral("vec_")}) {
+        if (baseName.startsWith(prefix, Qt::CaseInsensitive)) {
+            baseName.remove(0, prefix.size());
+            break;
+        }
+    }
+    for (const QString& suffix : {QStringLiteral("_embeddings"), QStringLiteral("_embedding"),
+                                  QStringLiteral("_vectors"), QStringLiteral("_vector"),
+                                  QStringLiteral("_vec"), QStringLiteral("_emb")}) {
+        if (baseName.endsWith(suffix, Qt::CaseInsensitive)) {
+            baseName.chop(suffix.size());
+            break;
+        }
+    }
+    QStringList candidates = {baseName, baseName + "s"};
+    if (baseName.endsWith('s', Qt::CaseInsensitive)) {
+        candidates << baseName.left(baseName.size() - 1);
+    }
+
+    const Table* sourceTable = nullptr;
+    for (const QString& candidate : candidates) {
+        for (const auto& table : m_schema.tables()) {
+            if (table.name.compare(candidate, Qt::CaseInsensitive) == 0) {
+                sourceTable = &table;
+                break;
+            }
+        }
+        if (sourceTable) {
+            break;
+        }
+    }
+
+    vec::ScatterView3D::LabelFn labelFn;  // empty = the 3D view's default "rowid N"
+    if (sourceTable) {
+        const auto hasColumn = [sourceTable](const QString& name) {
+            for (const auto& col : sourceTable->columns) {
+                if (col.name.compare(name, Qt::CaseInsensitive) == 0) {
+                    return col.name;  // real spelling
+                }
+            }
+            return QString();
+        };
+
+        // Which columns to show, in order, each cut to a max length:
+        // a headline (title/name), a category, and a body snippet.
+        QVector<QPair<QString, int>> shown;
+        const auto addFirstOf = [&](const QStringList& names, int maxLen) {
+            for (const QString& name : names) {
+                const QString real = hasColumn(name);
+                if (!real.isEmpty()) {
+                    shown.push_back({real, maxLen});
+                    return;
+                }
+            }
+        };
+        addFirstOf({"category", "type", "kind", "role"}, 30);
+        addFirstOf({"title", "name", "subject", "label"}, 70);
+        addFirstOf({"content", "text", "message", "body", "description", "summary"}, 110);
+
+        if (shown.isEmpty()) {  // no well-known names: take the first text columns
+            for (const auto& col : sourceTable->columns) {
+                if (!col.isPrimaryKey
+                    && (col.type.contains("TEXT", Qt::CaseInsensitive) || col.type.contains("CHAR", Qt::CaseInsensitive))) {
+                    shown.push_back({col.name, 100});
+                    if (shown.size() == 2) {
+                        break;
+                    }
+                }
+            }
+        }
+
+        QString idColumnName = "rowid";
+        for (const auto& col : sourceTable->columns) {
+            if (col.isPrimaryKey) {
+                idColumnName = col.name;
+                break;
+            }
+        }
+
+        if (!shown.isEmpty()) {
+            QStringList quotedColumns;
+            for (const auto& entry : shown) {
+                quotedColumns << "\"" + entry.first + "\"";
+            }
+            const QString sql = QString("SELECT %1 FROM \"%2\" WHERE \"%3\" = ?")
+                                    .arg(quotedColumns.join(", "), sourceTable->name,
+                                         idColumnName == "rowid" ? QString("rowid") : idColumnName);
+            // Hovering asks for the same point again and again: cache the text.
+            auto cache = std::make_shared<QHash<qint64, QString>>();
+            labelFn = [this, sql, shown, cache](qint64 rowid) -> QString {
+                if (const auto it = cache->constFind(rowid); it != cache->constEnd()) {
+                    return it.value();
+                }
+                QString text = QString("rowid %1").arg(rowid);  // fallback
+                if (m_db.isOpen()) {
+                    QSqlQuery query(m_db);
+                    query.prepare(sql);
+                    query.addBindValue(rowid);
+                    if (query.exec() && query.next()) {
+                        QStringList parts;
+                        for (int i = 0; i < shown.size(); ++i) {
+                            QString value = query.value(i).toString().simplified();
+                            if (value.size() > shown.at(i).second) {
+                                value = value.left(shown.at(i).second) + QStringLiteral("…");
+                            }
+                            if (!value.isEmpty()) {
+                                parts << value;
+                            }
+                        }
+                        if (!parts.isEmpty()) {
+                            text = QString("#%1 · %2").arg(rowid).arg(parts.join(" · "));
+                        }
+                    }
+                }
+                cache->insert(rowid, text);
+                return text;
+            };
+        }
+    }
+
+    // The explorer opens its own sqlite-vec connection to the same file.
+    auto* dialog = new vec::VectorExplorerDialog(m_db.databaseName(), tableName, std::move(labelFn), this);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+
+    // Clicking a point in 3D shows that record in the results grid.
+    // A vec0 table that declares its own primary key (e.g. "id") is addressed
+    // by that column; a plain one by rowid.
+    QString idColumn = "rowid";
+    for (const auto& vecTable : m_schema.vectorTables()) {
+        if (vecTable.name.compare(tableName, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+        for (const auto& col : vecTable.columns) {
+            if (col.isPrimaryKey) {
+                idColumn = col.name;
+                break;
+            }
+        }
+    }
+
+    connect(dialog, &vec::VectorExplorerDialog::recordActivated, this, [this, tableName, idColumn](qint64 rowid) {
+        const QString sql = (idColumn == "rowid")
+            ? QString("SELECT rowid, * FROM \"%1\" WHERE rowid = %2;").arg(tableName).arg(rowid)
+            : QString("SELECT * FROM \"%1\" WHERE \"%2\" = %3;").arg(tableName, idColumn).arg(rowid);
+        if (!m_sqlModeActive) {
+            m_sqlModeBtn->setChecked(true);
+        }
+        m_sqlEditor->setPlainText(sql);
+        m_queryFromVecClick = true;  // see captureVectorResult()
+        runQuery(sql);
+        if (!m_queryRunning) {
+            m_queryFromVecClick = false;  // query never started (busy / no database)
+        }
+    });
+    dialog->show();
+
+    m_vecDialog = dialog;
+    m_vecDialogTable = tableName;
+
+    // If the last SQL result came from this table (e.g. a MATCH ... AND k = 10
+    // search), light those rows up straight away.
+    if (!m_lastResultRowids.isEmpty() && m_lastResultVecTable.compare(tableName, Qt::CaseInsensitive) == 0) {
+        dialog->highlightRowids(
+            m_lastResultRowids,
+            tr("SQL result: %1 vectors highlighted in %2.").arg(m_lastResultRowids.size()).arg(tableName));
+    }
 }
 
 void MainWindow::onTreeItemClicked(QTreeWidgetItem* item, int column)
@@ -648,6 +947,32 @@ void MainWindow::onTreeItemClicked(QTreeWidgetItem* item, int column)
     if (!item) {
         return;
     }
+
+    // A vec0 table (or one of its columns). vec0 tables aren't in the query
+    // builder's schema, so clicking one switches to SQL mode and runs a
+    // preview query (the worker connection has sqlite-vec loaded). The user
+    // can then edit the SQL freely, e.g. add a MATCH ... AND k = ... clause.
+    if (item->data(0, Qt::UserRole + 1).toBool()) {
+        if (item->parent() != nullptr) {
+            return;  // a column row: nothing to do
+        }
+        item->setExpanded(!item->isExpanded());
+
+        QString vecName = item->data(0, Qt::UserRole + 2).toString();
+        if (vecName.isEmpty()) {
+            return;
+        }
+        vecName.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+        const QString previewSql = QString("SELECT * FROM \"%1\" LIMIT 100;").arg(vecName);
+
+        if (!m_sqlModeActive) {
+            m_sqlModeBtn->setChecked(true);  // fires onSqlModeToggled -> SQL page
+        }
+        m_sqlEditor->setPlainText(previewSql);
+        runQuery(previewSql);
+        return;
+    }
+
     // Table rows and their column/index children all carry the owning
     // table name in UserRole, so clicking any of them also focuses that
     // table.
@@ -1149,6 +1474,7 @@ void MainWindow::runQuery(const QString& sql)
     m_executeBtn->setEnabled(false);
     showRunning();
 
+    m_lastSql = sql;
     emit requestQuery(sql);
 }
 
@@ -1157,11 +1483,80 @@ void MainWindow::onQuerySucceeded(QStringList headers, ResultRows rows)
     m_queryRunning = false;
     m_executeBtn->setEnabled(true);
     showResults(headers, rows);
+    captureVectorResult(headers, rows);
+}
+
+void MainWindow::captureVectorResult(const QStringList& headers, const ResultRows& rows)
+{
+    m_lastResultRowids.clear();
+    m_lastResultVecTable.clear();
+
+    // The query that a click in the 3D view started returns just that one
+    // record; the 3D view already shows its neighbours, so leave it alone.
+    if (m_queryFromVecClick) {
+        m_queryFromVecClick = false;
+        return;
+    }
+
+    // Which vec0 table does this SQL read from?
+    for (const auto& table : m_schema.vectorTables()) {
+        const QRegularExpression nameRe("\\b" + QRegularExpression::escape(table.name) + "\\b",
+                                        QRegularExpression::CaseInsensitiveOption);
+        if (nameRe.match(m_lastSql).hasMatch()) {
+            m_lastResultVecTable = table.name;
+            break;
+        }
+    }
+    if (m_lastResultVecTable.isEmpty()) {
+        return;
+    }
+
+    // The result has to carry the vec0 record id, e.g.
+    //   SELECT rowid, distance FROM t WHERE embedding MATCH ... AND k = 10
+    // or, for a vec0 table with its own primary key, that column (e.g. "id").
+    QStringList idNames = {"rowid"};
+    for (const auto& vecTable : m_schema.vectorTables()) {
+        if (vecTable.name.compare(m_lastResultVecTable, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+        for (const auto& col : vecTable.columns) {
+            if (col.isPrimaryKey) {
+                idNames << col.name;
+            }
+        }
+    }
+    int rowidColumn = -1;
+    for (int c = 0; c < headers.size() && rowidColumn < 0; ++c) {
+        for (const QString& idName : idNames) {
+            if (headers.at(c).compare(idName, Qt::CaseInsensitive) == 0) {
+                rowidColumn = c;
+                break;
+            }
+        }
+    }
+    if (rowidColumn < 0) {
+        return;
+    }
+    for (const auto& row : rows) {
+        bool ok = false;
+        const qint64 rowid = row.value(rowidColumn).toLongLong(&ok);
+        if (ok) {
+            m_lastResultRowids.insert(rowid);
+        }
+    }
+
+    if (m_vecDialog && !m_lastResultRowids.isEmpty()
+        && m_vecDialogTable.compare(m_lastResultVecTable, Qt::CaseInsensitive) == 0) {
+        m_vecDialog->highlightRowids(
+            m_lastResultRowids,
+            tr("SQL result: %1 vectors highlighted in %2.").arg(m_lastResultRowids.size()).arg(m_lastResultVecTable));
+    }
 }
 
 void MainWindow::onQueryFailed(QString message)
 {
     m_queryRunning = false;
+    m_queryFromVecClick = false;
     m_executeBtn->setEnabled(true);
     m_editableTable.clear();
     m_editablePkColumns.clear();

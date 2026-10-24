@@ -3,7 +3,10 @@
 // Use this for all vec0 work. Qt's bundled QSQLITE plugin is built without
 // load_extension, so it cannot host sqlite-vec.
 
+#include <QByteArray>
 #include <QString>
+#include <QStringList>
+#include <QVector>
 #include <QtGlobal>
 #include <optional>
 #include <span>
@@ -36,6 +39,13 @@ public:
 
     QString vecVersion();                       // e.g. "v0.1.x", empty on failure
 
+    // Runs arbitrary user SQL (one or more ';'-separated statements) with
+    // sqlite-vec active, so vec0 tables and vec_* functions work. headers/rows
+    // receive the result of the last statement that returns columns, already
+    // converted to display strings (BLOBs are summarised, not dumped).
+    // On failure returns false and lastError() holds SQLite's message.
+    bool runSql(const QString& sql, QStringList& headers, QVector<QStringList>& rows);
+
     // CREATE VIRTUAL TABLE IF NOT EXISTS <table> USING vec0(embedding float[N] ...)
     bool createVecTable(const QString& table, int dimensions, Metric metric = Metric::Cosine);
 
@@ -52,6 +62,7 @@ public:
 
 private:
     bool exec(const char* sql);
+    QByteArray idColumn(const QString& table);  // "rowid" or the table's own "id" column
     bool fail(const char* what);                // stores sqlite3_errmsg, returns false
     bool error(const QString& msg);             // stores msg, returns false
 

@@ -2,10 +2,86 @@
 
 #include <QSqlQuery>
 #include <QSqlError>
+#include <QStringList>
+
+namespace {
+
+// Parses the column list out of
+//   CREATE VIRTUAL TABLE name USING vec0(embedding float[384], id integer primary key, ...)
+// PRAGMA table_info can't be used on a vec0 table (Qt's SQLite has no vec0
+// module), so the declaration itself is the only source of column info.
+QVector<Column> parseVec0Columns(const QString& createSql)
+{
+    QVector<Column> columns;
+
+    const int usingPos = createSql.indexOf(QStringLiteral("vec0"), 0, Qt::CaseInsensitive);
+    if (usingPos < 0) {
+        return columns;
+    }
+    const int open = createSql.indexOf(QLatin1Char('('), usingPos);
+    if (open < 0) {
+        return columns;
+    }
+
+    // Split the argument list on top-level commas only: "float[384]" and
+    // any nested parentheses must not be split apart.
+    QStringList parts;
+    QString current;
+    int depth = 1;
+    for (int i = open + 1; i < createSql.size(); ++i) {
+        const QChar ch = createSql.at(i);
+        if (ch == QLatin1Char('(') || ch == QLatin1Char('[')) {
+            ++depth;
+        } else if (ch == QLatin1Char(')') || ch == QLatin1Char(']')) {
+            --depth;
+            if (depth == 0) {
+                break;  // closing paren of vec0(...)
+            }
+        } else if (ch == QLatin1Char(',') && depth == 1) {
+            parts << current;
+            current.clear();
+            continue;
+        }
+        current += ch;
+    }
+    if (!current.trimmed().isEmpty()) {
+        parts << current;
+    }
+
+    for (const QString& rawPart : parts) {
+        QString part = rawPart.simplified();
+        if (part.isEmpty()) {
+            continue;
+        }
+        // Auxiliary columns are declared as "+name type".
+        if (part.startsWith(QLatin1Char('+'))) {
+            part.remove(0, 1);
+        }
+        // Table-level options such as "chunk_size=1024" are not columns.
+        const int space = part.indexOf(QLatin1Char(' '));
+        const int eq = part.indexOf(QLatin1Char('='));
+        if (eq >= 0 && (space < 0 || eq < space)) {
+            continue;
+        }
+
+        Column col;
+        QString name = space < 0 ? part : part.left(space);
+        name.remove(QLatin1Char('"')).remove(QLatin1Char('`'));
+        name.remove(QLatin1Char('[')).remove(QLatin1Char(']'));
+        col.name = name;
+        col.type = space < 0 ? QString() : part.mid(space + 1);
+        col.isPrimaryKey = part.contains(QStringLiteral("primary key"), Qt::CaseInsensitive);
+        columns.push_back(col);
+    }
+    return columns;
+}
+
+}  // namespace
 
 bool Schema::load(QSqlDatabase& db)
 {
     m_tables.clear();
+    m_vectorTables.clear();
     m_foreignKeys.clear();
     m_indexes.clear();
     m_errorMessage.clear();
@@ -13,17 +89,24 @@ bool Schema::load(QSqlDatabase& db)
 
     // sqlite-vec (vec0) virtual tables cannot be inspected through Qt's bundled
     // SQLite (the vec0 module is not loaded there, so PRAGMA table_info fails with
-    // "no such module: vec0"). Hide them and their shadow tables from the schema;
-    // they are explored via Tools > Vector space (3D) instead.
+    // "no such module: vec0"). They (and their shadow tables) are kept out of
+    // m_tables, but each vec0 table is still recorded in m_vectorTables, with
+    // its columns parsed from the CREATE statement, so the table list can show
+    // it. Browsing the vectors themselves is done via Tools > Vector space (3D).
     QStringList vecTables;
     {
         QSqlQuery vecQuery(db);
         if (vecQuery.exec(
-                "SELECT name FROM sqlite_master "
+                "SELECT name, sql FROM sqlite_master "
                 "WHERE type='table' AND sql LIKE 'CREATE VIRTUAL TABLE%' "
-                "AND lower(sql) LIKE '%using vec0%';")) {
+                "AND lower(sql) LIKE '%using vec0%' "
+                "ORDER BY name;")) {
             while (vecQuery.next()) {
-                vecTables << vecQuery.value(0).toString();
+                Table vecTable;
+                vecTable.name = vecQuery.value(0).toString();
+                vecTable.columns = parseVec0Columns(vecQuery.value(1).toString());
+                vecTables << vecTable.name;
+                m_vectorTables.push_back(vecTable);
             }
         }
     }

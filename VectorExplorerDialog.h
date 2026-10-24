@@ -3,6 +3,7 @@
 #include "VecDatabase.h"
 
 #include <QDialog>
+#include <QSet>
 
 class QLabel;
 class QSpinBox;
@@ -16,6 +17,10 @@ class VectorExplorerDialog : public QDialog {
 public:
     VectorExplorerDialog(const QString& dbPath, QString vecTable,
                          ScatterView3D::LabelFn labelFn, QWidget* parent = nullptr);
+
+    // Highlights the given vec0 rowids in the 3D view (e.g. the rows returned
+    // by a SQL vector search) and shows `note` in the status line.
+    void highlightRowids(const QSet<qint64>& rowids, const QString& note);
 
 signals:
     // Emitted on every click: the vec0 rowid equals the source table's rowid/id.

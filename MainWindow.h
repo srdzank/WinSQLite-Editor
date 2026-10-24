@@ -4,7 +4,9 @@
 #include <QLabel>
 #include <QMainWindow>
 #include <QPlainTextEdit>
+#include <QPointer>
 #include <QPushButton>
+#include <QSet>
 #include <QSqlDatabase>
 #include <QStackedWidget>
 #include <QTableWidget>
@@ -19,6 +21,7 @@
 #include "QueryWorker.h"
 #include "Schema.h"
 #include "SqlEditor.h"
+#include "VectorExplorerDialog.h"
 
 class MainWindow : public QMainWindow
 {
@@ -56,6 +59,10 @@ private slots:
     void onExecuteClicked();
     void onSqlTextChanged();
 
+    // "3D view" button / tree context menu: opens the sqlite-vec 3D scatter
+    // explorer for a vec0 table of the open database.
+    void onView3dClicked();
+
     // Delivered from QueryWorker, running on m_queryThread.
     void onQuerySucceeded(QStringList headers, ResultRows rows);
     void onQueryFailed(QString message);
@@ -89,6 +96,16 @@ private:
     void applyDarkTheme();
     void refreshQueryPanel();
     void populateTableTree();
+
+    // Opens the non-modal 3D vector explorer for tableName (a vec0 table in
+    // the open database). Clicking a point runs a query for that record.
+    void openVectorSpace(const QString& tableName);
+
+    // After every successful query: if it read a vec0 table and returned a
+    // "rowid" column, remember those rowids and (when the 3D view of that
+    // table is open) highlight them there - this is how the result of a SQL
+    // vector search (MATCH ... AND k = N) shows up in 3D.
+    void captureVectorResult(const QStringList& headers, const ResultRows& rows);
 
     // Preferences (Settings dialog), persisted via QSettings.
     // loadSettings() runs before buildUi()/applyDarkTheme() so the very
@@ -221,6 +238,7 @@ private:
     SqlEditor* m_sqlEditor = nullptr;        // editable, used in SQL mode, with autocomplete
 
     QPushButton* m_sqlModeBtn = nullptr;
+    QPushButton* m_view3dBtn = nullptr;  // enabled only when the database has vec0 tables
     QPushButton* m_executeBtn = nullptr;
     QPushButton* m_addStepBtn = nullptr;
 
@@ -238,6 +256,16 @@ private:
     // Empty m_editableTable means the grid is read-only.
     QString m_editableTable;
     QStringList m_editablePkColumns;
+
+    // 3D vector explorer state (see captureVectorResult()).
+    QPointer<vec::VectorExplorerDialog> m_vecDialog;  // most recently opened 3D view
+    QString m_vecDialogTable;                         // the vec0 table it shows
+    QString m_lastSql;                                // SQL of the query in flight / last run
+    QString m_lastResultVecTable;                     // vec0 table the last result came from
+    QSet<qint64> m_lastResultRowids;                  // rowids of the last such result
+    // True for the query started by clicking a point in the 3D view: its
+    // single-row result must not overwrite the neighbour highlight there.
+    bool m_queryFromVecClick = false;
     // True while showResults() is populating cells, so those
     // programmatic changes don't get mistaken for user edits.
     bool m_populatingResults = false;

@@ -48,7 +48,12 @@ bool VectorExplorerDialog::loadData(const QString& dbPath)
 
     std::vector<Embedding> items = m_db.loadAll(m_table);
     if (items.empty()) {
-        m_status->setText(tr("No vectors found in '%1'.").arg(m_table));
+        // loadAll() returns an empty list both for an empty table and for a
+        // failed read - the error text tells them apart.
+        if (!m_db.lastError().isEmpty())
+            m_status->setText(tr("Error: %1").arg(m_db.lastError()));
+        else
+            m_status->setText(tr("No vectors found in '%1'.").arg(m_table));
         return true;
     }
 
@@ -64,6 +69,12 @@ bool VectorExplorerDialog::loadData(const QString& dbPath)
     m_status->setText(tr("%1 vectors, %2 dimensions -> PCA 3D. Click a point to inspect it.")
                           .arg(items.size()).arg(dims));
     return true;
+}
+
+void VectorExplorerDialog::highlightRowids(const QSet<qint64>& rowids, const QString& note)
+{
+    m_view->setHighlighted(QSet<qint64>(rowids));
+    m_status->setText(note);
 }
 
 void VectorExplorerDialog::onPointClicked(qint64 rowid)
