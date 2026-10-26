@@ -85,7 +85,7 @@ winget install WinSQLiteEditor
 | Schema & Table Browser | SQL Query & Results Execution |
 | :---: | :---: |
 | ![App Screenshot](pic100.png) | ![App Screenshot](pic101.png) |
-
+| ![App Screenshot](aaaa7.png) | ![App Screenshot](aaaa8.png) |
 ---
 
 ## Video Demo & Screenshots
