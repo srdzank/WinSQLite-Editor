@@ -57,7 +57,7 @@ winget install WinSQLiteEditor
 
 ## Edition Comparison
 
-| Feature / Benefit | Microsoft Store ($7.99) | Portable Archive (.zip) (Free) |
+| Feature / Benefit | Microsoft Store | Portable Archive (.zip) (Free) |
 | :--- | :---: | :---: |
 | **Core Features** *(sqlite_vec, 3D View, ER)* | ✅ | ✅ |
 | **100% Offline & Privacy-First** | ✅ | ✅ |
