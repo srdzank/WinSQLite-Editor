@@ -1,11 +1,33 @@
 #include <QApplication>
 #include <QIcon>
+#include <QSettings>
+
+#ifdef Q_OS_WASM
+#include <emscripten.h>
+#include <emscripten/em_js.h>
+
+// Browser: the virtual filesystem is in-memory and is wiped on every page
+// refresh. Mount an IndexedDB-backed folder and load whatever was saved
+// there last time, so QSettings (preferences + query history) survives.
+// Needs -sASYNCIFY (already set in CMakeLists.txt) to wait for the load.
+EM_ASYNC_JS(void, mountPersistentStorage, (), {
+    try { FS.mkdir('/persist'); } catch (e) {}
+    try { FS.mount(IDBFS, {}, '/persist'); } catch (e) {}
+    await new Promise((resolve) => FS.syncfs(true, (err) => resolve()));
+});
+#endif
 
 #include "MainWindow.h"
 
 int main(int argc, char* argv[])
 {
     QApplication app(argc, argv);
+
+#ifdef Q_OS_WASM
+    mountPersistentStorage();
+    QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, "/persist");
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, "/persist");
+#endif
 
     // QSettings (used to persist the Settings dialog's preferences)
     // needs an organization/application name to know where to store

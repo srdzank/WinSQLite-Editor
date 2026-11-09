@@ -7,6 +7,7 @@
 #include <QPointer>
 #include <QPushButton>
 #include <QSet>
+#include <QSplitter>
 #include <QSqlDatabase>
 #include <QStackedWidget>
 #include <QTableWidget>
@@ -63,6 +64,9 @@ private slots:
     // explorer for a vec0 table of the open database.
     void onView3dClicked();
 
+    // Top bar "History" button: drop-down of previously executed queries.
+    void onHistoryClicked();
+
     // Delivered from QueryWorker, running on m_queryThread.
     void onQuerySucceeded(QStringList headers, ResultRows rows);
     void onQueryFailed(QString message);
@@ -89,6 +93,8 @@ private slots:
     void onInsertRowTriggered();
     void onResultCellEdited(QTableWidgetItem* item);
     void onExportResultsTriggered();
+    // Results panel Maximize/Restore (button + Data menu + F11).
+    void onToggleMaximizeResults();
 
 private:
     void buildUi();
@@ -118,6 +124,14 @@ private:
     // person last saved/opened something.
     void rememberDialogDir(const QString& filePath);
 
+    // Query history, persisted via QSettings (most recent first, capped,
+    // de-duplicated). Only successful queries are recorded.
+    void loadHistory();
+    void saveHistory();
+    void addToHistory(const QString& sql);
+    // Puts sql into the raw SQL editor (switching to SQL mode if needed).
+    void loadSqlIntoEditor(const QString& sql);
+
     // Query builder "+ Add step" flows.
     void addJoinStep();
     void addConditionStep();
@@ -141,6 +155,9 @@ private:
     // onImportDatabaseTriggered() (which runs many statements at once,
     // not a single one) can reuse it too.
     void reloadSchemaAndFocus();
+    // Runs every statement of an SQL script against m_db (best effort) and
+    // reloads the schema. Shared by the desktop and WebAssembly import paths.
+    void importSqlText(const QString& contents);
     void setSchemaActionsEnabled(bool enabled);
 
     // Refreshes everything that depends on m_schema but doesn't depend on
@@ -208,6 +225,7 @@ private:
     int m_editorFontSize = 11;
     bool m_confirmDestructiveActions = true;
     QString m_defaultDialogDir;
+    QStringList m_queryHistory;  // most recent first
 
     // Query execution happens on this dedicated thread/worker so a slow
     // query never blocks the UI. The worker has its own SQLite
@@ -238,6 +256,7 @@ private:
     SqlEditor* m_sqlEditor = nullptr;        // editable, used in SQL mode, with autocomplete
 
     QPushButton* m_sqlModeBtn = nullptr;
+    QPushButton* m_historyBtn = nullptr;  // drop-down of past queries
     QPushButton* m_view3dBtn = nullptr;  // enabled only when the database has vec0 tables
     QPushButton* m_executeBtn = nullptr;
     QPushButton* m_addStepBtn = nullptr;
@@ -248,6 +267,14 @@ private:
     // Exports the currently-displayed grid to CSV/TSV/JSON/SQL. Enabled
     // only while the grid actually has columns (see showResults()).
     QPushButton* m_exportResultsBtn = nullptr;
+
+    // Maximize/Restore for the results panel: while maximized, the
+    // diagram/query-builder splitter and the table list are hidden so
+    // the results grid gets the whole window.
+    QPushButton* m_maximizeResultsBtn = nullptr;
+    QSplitter* m_bodySplitter = nullptr;  // diagram + query builder
+    QWidget* m_leftPanel = nullptr;       // table list
+    bool m_resultsMaximized = false;
 
     // Direct in-place editing of the results grid is only enabled when
     // the last successful query was exactly "SELECT * FROM table" (no

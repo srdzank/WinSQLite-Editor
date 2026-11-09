@@ -9,6 +9,8 @@
 #include <QAction>
 #include <QColor>
 #include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -35,9 +37,14 @@
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QUrl>
 #include <QTextCursor>
 #include <QTextStream>
 #include <QVariantMap>
+
+#ifdef Q_OS_WASM
+#include <emscripten.h>
+#endif
 
 #include "CreateIndexDialog.h"
 #include "CreateTableDialog.h"
@@ -66,6 +73,19 @@ const QString kSettingsUiFontSize = "appearance/uiFontSize";
 const QString kSettingsEditorFontSize = "appearance/editorFontSize";
 const QString kSettingsConfirmDestructive = "behavior/confirmDestructiveActions";
 const QString kSettingsDefaultDir = "files/defaultDialogDir";
+const QString kSettingsQueryHistory = "history/queries";
+constexpr int kMaxHistoryEntries = 100;
+
+// Browser only: QSettings writes into the in-memory filesystem, so push it
+// to IndexedDB after each save (see mountPersistentStorage() in main.cpp).
+// No-op on desktop, where QSettings is already persistent.
+void flushPersistentStorage(QSettings& settings)
+{
+    settings.sync();
+#ifdef Q_OS_WASM
+    EM_ASM({ if (typeof FS !== 'undefined') { FS.syncfs(false, function (err) {}); } });
+#endif
+}
 constexpr int kDefaultUiFontSize = 12;
 constexpr int kDefaultEditorFontSize = 11;
 constexpr bool kDefaultConfirmDestructive = true;
@@ -162,6 +182,18 @@ QString sqlLiteralForResultsExport(const QString& text)
     return "'" + escaped + "'";
 }
 
+#ifdef Q_OS_WASM
+// Browser: sends a file from the virtual filesystem to the user as a download.
+void wasmDownload(const QString& path)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly)) {
+        return;
+    }
+    QFileDialog::saveFileContent(f.readAll(), QFileInfo(path).fileName());
+}
+#endif
+
 } // namespace
 
 MainWindow::MainWindow(QWidget* parent)
@@ -169,6 +201,7 @@ MainWindow::MainWindow(QWidget* parent)
 {
     setWindowTitle("WinSQLite");
     loadSettings();
+    loadHistory();
     buildUi();
     buildMenus();
     applyDarkTheme();
@@ -201,13 +234,24 @@ void MainWindow::buildUi()
     m_sqlModeBtn = new QPushButton("SQL mode", topBar);
     m_sqlModeBtn->setCheckable(true);
     m_sqlModeBtn->setEnabled(false);
+    m_historyBtn = new QPushButton("History", topBar);
+    m_historyBtn->setToolTip("Re-run or edit a previously executed query");
+    m_historyBtn->setEnabled(false);
     m_view3dBtn = new QPushButton("3D view", topBar);
     m_view3dBtn->setToolTip("Explore the sqlite-vec (vec0) vectors of this database in 3D");
     m_view3dBtn->setEnabled(false);
     m_executeBtn = new QPushButton("Execute", topBar);
     m_executeBtn->setObjectName("primaryButton");
     m_executeBtn->setEnabled(false);
+    auto* donateBtn = new QPushButton("Donate", topBar);
+    donateBtn->setToolTip("Support WinSQLite - opens the Microsoft Store page");
+    connect(donateBtn, &QPushButton::clicked, this, [] {
+        QDesktopServices::openUrl(
+            QUrl("https://apps.microsoft.com/detail/9nrd3hmxzw41?hl=en-US&gl=US&ocid=pdpshare"));
+    });
+    topLayout->addWidget(donateBtn);
     topLayout->addWidget(m_view3dBtn);
+    topLayout->addWidget(m_historyBtn);
     topLayout->addWidget(m_sqlModeBtn);
     topLayout->addWidget(m_executeBtn);
     rootLayout->addWidget(topBar);
@@ -332,6 +376,9 @@ void MainWindow::buildUi()
     m_exportResultsBtn = new QPushButton("Export…", resultsPanel);
     m_exportResultsBtn->setEnabled(false);  // enabled once a query returns at least one column
     resultsHeader->addWidget(m_exportResultsBtn);
+    m_maximizeResultsBtn = new QPushButton("Maximize", resultsPanel);
+    m_maximizeResultsBtn->setToolTip("Show results over the whole window (F11)");
+    resultsHeader->addWidget(m_maximizeResultsBtn);
     resultsLayout->addLayout(resultsHeader);
 
     m_resultsTable = new QTableWidget(resultsPanel);
@@ -356,6 +403,10 @@ void MainWindow::buildUi()
 
     rootLayout->addWidget(outerSplitter, 1);
 
+    // Kept for onToggleMaximizeResults().
+    m_bodySplitter = body;
+    m_leftPanel = leftPanel;
+
     setCentralWidget(central);
 
     connect(m_tableTree, &QTreeWidget::itemClicked, this, &MainWindow::onTreeItemClicked);
@@ -364,6 +415,7 @@ void MainWindow::buildUi()
     connect(m_sqlModeBtn, &QPushButton::toggled, this, &MainWindow::onSqlModeToggled);
     connect(m_executeBtn, &QPushButton::clicked, this, &MainWindow::onExecuteClicked);
     connect(m_view3dBtn, &QPushButton::clicked, this, &MainWindow::onView3dClicked);
+    connect(m_historyBtn, &QPushButton::clicked, this, &MainWindow::onHistoryClicked);
 
     // vec0 tables: double-click or right-click opens the 3D explorer.
     connect(m_tableTree, &QTreeWidget::itemDoubleClicked, this, [this](QTreeWidgetItem* item, int) {
@@ -389,6 +441,7 @@ void MainWindow::buildUi()
     connect(m_sqlEditor, &QPlainTextEdit::textChanged, this, &MainWindow::onSqlTextChanged);
     connect(m_resultsTable, &QTableWidget::itemChanged, this, &MainWindow::onResultCellEdited);
     connect(m_exportResultsBtn, &QPushButton::clicked, this, &MainWindow::onExportResultsTriggered);
+    connect(m_maximizeResultsBtn, &QPushButton::clicked, this, &MainWindow::onToggleMaximizeResults);
 }
 
 void MainWindow::buildMenus()
@@ -442,6 +495,12 @@ void MainWindow::buildMenus()
     QAction* exportResultsAction = dataMenu->addAction("Export &Results…");
     exportResultsAction->setShortcut(QKeySequence("Ctrl+Shift+E"));
     connect(exportResultsAction, &QAction::triggered, this, &MainWindow::onExportResultsTriggered);
+
+    // Not in m_schemaActions: it only rearranges the window, so it works
+    // with or without a database open.
+    QAction* maximizeResultsAction = dataMenu->addAction("&Maximize Results");
+    maximizeResultsAction->setShortcut(QKeySequence(Qt::Key_F11));
+    connect(maximizeResultsAction, &QAction::triggered, this, &MainWindow::onToggleMaximizeResults);
 
     // These all act on the currently open database, so they start
     // disabled - openDatabase() enables them once one is loaded.
@@ -572,6 +631,7 @@ bool MainWindow::openDatabase(const QString& path)
     setWindowTitle("WinSQLite — " + QFileInfo(path).fileName());
     setSchemaActionsEnabled(true);
     m_sqlModeBtn->setEnabled(true);
+    m_historyBtn->setEnabled(true);
     m_executeBtn->setEnabled(true);
 
     syncSchemaUi();
@@ -606,6 +666,11 @@ void MainWindow::resetUiForNewDatabase()
     m_statusLabel->clear();
     m_tableTree->clear();
     m_view3dBtn->setEnabled(false);
+
+    // Don't carry a maximized results panel over into a new database.
+    if (m_resultsMaximized) {
+        onToggleMaximizeResults();
+    }
 }
 
 void MainWindow::syncSchemaUi()
@@ -1448,50 +1513,58 @@ QString MainWindow::resolveTableName(const QString& rawName) const
 
 void MainWindow::startQueryThread(const QString& dbPath)
 {
-    // Opening a database is no longer a one-time thing (Database menu
-    // lets the user switch mid-session), so always tear down any
-    // previous worker/thread cleanly first.
+    // Opening a database is not a one-time thing (Database menu lets the
+    // user switch mid-session), so always tear down any previous worker first.
     stopQueryThread();
 
+#ifdef Q_OS_WASM
+    // WebAssembly build has no pthread support: the worker lives on the
+    // GUI thread. Queued connection keeps "Running..." visible first.
+    m_queryThread = nullptr;
+    m_queryWorker = new QueryWorker(dbPath);
+    connect(this, &MainWindow::requestQuery, m_queryWorker, &QueryWorker::execute, Qt::QueuedConnection);
+    connect(m_queryWorker, &QueryWorker::succeeded, this, &MainWindow::onQuerySucceeded);
+    connect(m_queryWorker, &QueryWorker::failed, this, &MainWindow::onQueryFailed);
+#else
     m_queryThread = new QThread(this);
     m_queryWorker = new QueryWorker(dbPath);
     m_queryWorker->moveToThread(m_queryThread);
 
     // requestQuery() is emitted on the GUI thread and delivered to
     // execute() on m_queryThread; succeeded()/failed() make the return
-    // trip the same way. Both connections are automatically queued
-    // because sender and receiver live on different threads.
+    // trip the same way (automatically queued: different threads).
     connect(this, &MainWindow::requestQuery, m_queryWorker, &QueryWorker::execute);
     connect(m_queryWorker, &QueryWorker::succeeded, this, &MainWindow::onQuerySucceeded);
     connect(m_queryWorker, &QueryWorker::failed, this, &MainWindow::onQueryFailed);
 
     m_queryThread->start();
+#endif
 }
 
 void MainWindow::stopQueryThread()
 {
-    if (!m_queryThread) {
-        return;
+    if (m_queryThread) {
+        m_queryThread->quit();
+        m_queryThread->wait();
+        // The worker was moved onto the thread, not parented to it, so it
+        // must be deleted explicitly once the thread has fully stopped.
+        delete m_queryWorker;
+        delete m_queryThread;
+    } else if (m_queryWorker) {
+        delete m_queryWorker;  // WASM: worker lives on the GUI thread
     }
-
-    m_queryThread->quit();
-    m_queryThread->wait();
-
-    // m_queryWorker was moved onto m_queryThread via moveToThread(), not
-    // parented to it - QObject parent/child and thread affinity are
-    // separate, so deleting the thread alone would leak the worker. Now
-    // that wait() confirms the thread has fully stopped, it's safe to
-    // delete both directly from the GUI thread.
-    delete m_queryWorker;
     m_queryWorker = nullptr;
-    delete m_queryThread;
     m_queryThread = nullptr;
     m_queryRunning = false;
 }
 
 void MainWindow::runQuery(const QString& sql)
 {
+#ifdef Q_OS_WASM
+    if (!m_queryWorker) {
+#else
     if (!m_queryThread || !m_queryWorker) {
+#endif
         showError("Database is not open.");
         return;
     }
@@ -1537,6 +1610,11 @@ void MainWindow::onQuerySucceeded(QStringList headers, ResultRows rows)
 {
     m_queryRunning = false;
     m_executeBtn->setEnabled(true);
+    // Queries fired by clicking a point in the 3D view are generated, not
+    // typed by the person, so they don't belong in the history.
+    if (!m_queryFromVecClick) {
+        addToHistory(m_lastSql);
+    }
     showResults(headers, rows);
     captureVectorResult(headers, rows);
 }
@@ -1651,6 +1729,7 @@ void MainWindow::showResults(const QStringList& headers, const ResultRows& rows)
 
         for (int c = 0; c < columnCount && c < row.size(); ++c) {
             auto* item = new QTableWidgetItem(row[c]);
+            item->setToolTip(row[c]);  // full text for cells cut off by the column width cap
             if (!editable) {
                 item->setFlags(item->flags() & ~Qt::ItemIsEditable);
             }
@@ -1662,6 +1741,19 @@ void MainWindow::showResults(const QStringList& headers, const ResultRows& rows)
         ++rowCount;
     }
     m_resultsTable->resizeColumnsToContents();
+    // Cap very wide columns (long text, JSON, ...) so one column can't push
+    // the rest off-screen; the user can still drag the header to widen it,
+    // and the full value is in the cell's tooltip.
+    constexpr int kMaxColWidth = 400;
+    for (int c = 0; c < columnCount; ++c) {
+        if (m_resultsTable->columnWidth(c) > kMaxColWidth) {
+            m_resultsTable->setColumnWidth(c, kMaxColWidth);
+        }
+    }
+    m_resultsTable->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+    m_resultsTable->horizontalHeader()->setStretchLastSection(true);
+    m_resultsTable->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_resultsTable->setTextElideMode(Qt::ElideRight);
 
     m_statusLabel->setStyleSheet("color: #888780;");
     m_statusLabel->setText(rowCount == 1 ? "1 row" : QString("%1 rows").arg(rowCount));
@@ -1703,6 +1795,72 @@ void MainWindow::loadSettings()
     m_defaultDialogDir = settings.value(kSettingsDefaultDir, QString()).toString();
 }
 
+void MainWindow::loadHistory()
+{
+    QSettings settings;
+    m_queryHistory = settings.value(kSettingsQueryHistory).toStringList();
+    while (m_queryHistory.size() > kMaxHistoryEntries) {
+        m_queryHistory.removeLast();
+    }
+}
+
+void MainWindow::saveHistory()
+{
+    QSettings settings;
+    settings.setValue(kSettingsQueryHistory, m_queryHistory);
+    flushPersistentStorage(settings);
+}
+
+void MainWindow::addToHistory(const QString& sql)
+{
+    const QString trimmed = sql.trimmed();
+    if (trimmed.isEmpty()) {
+        return;
+    }
+    // Re-running a query moves it back to the top instead of duplicating it.
+    m_queryHistory.removeAll(trimmed);
+    m_queryHistory.prepend(trimmed);
+    while (m_queryHistory.size() > kMaxHistoryEntries) {
+        m_queryHistory.removeLast();
+    }
+    saveHistory();
+}
+
+void MainWindow::loadSqlIntoEditor(const QString& sql)
+{
+    if (!m_sqlModeActive) {
+        m_sqlModeBtn->setChecked(true);  // fires onSqlModeToggled -> SQL page
+    }
+    m_sqlEditor->setPlainText(sql);
+}
+
+void MainWindow::onHistoryClicked()
+{
+    QMenu menu(this);
+    if (m_queryHistory.isEmpty()) {
+        menu.addAction("No queries yet")->setEnabled(false);
+    } else {
+        for (const QString& sql : m_queryHistory) {
+            // One-line label for the menu; the full text is in the tooltip.
+            QString label = sql.simplified();
+            if (label.size() > 90) {
+                label = label.left(87) + "...";
+            }
+            QAction* action = menu.addAction(label);
+            action->setToolTip(sql);
+            connect(action, &QAction::triggered, this, [this, sql] { loadSqlIntoEditor(sql); });
+        }
+        menu.setToolTipsVisible(true);
+        menu.addSeparator();
+        QAction* clear = menu.addAction("Clear history");
+        connect(clear, &QAction::triggered, this, [this] {
+            m_queryHistory.clear();
+            saveHistory();
+        });
+    }
+    menu.exec(m_historyBtn->mapToGlobal(QPoint(0, m_historyBtn->height())));
+}
+
 void MainWindow::saveSettings()
 {
     QSettings settings;
@@ -1710,6 +1868,7 @@ void MainWindow::saveSettings()
     settings.setValue(kSettingsEditorFontSize, m_editorFontSize);
     settings.setValue(kSettingsConfirmDestructive, m_confirmDestructiveActions);
     settings.setValue(kSettingsDefaultDir, m_defaultDialogDir);
+    flushPersistentStorage(settings);
 }
 
 void MainWindow::rememberDialogDir(const QString& filePath)
@@ -1740,6 +1899,12 @@ void MainWindow::onSettingsTriggered()
 
 void MainWindow::onNewDatabaseTriggered()
 {
+#ifdef Q_OS_WASM
+    // Browser: no real disk. A fresh database lives in the in-memory
+    // virtual filesystem; use Export to download it.
+    QDir().mkpath("/tmp");
+    QString path = "/tmp/new.sqlite";
+#else
     QString path = QFileDialog::getSaveFileName(this, "Create New SQLite Database", m_defaultDialogDir,
                                                   "SQLite databases (*.sqlite *.db *.sqlite3);;All files (*)");
     if (path.isEmpty()) {
@@ -1749,10 +1914,9 @@ void MainWindow::onNewDatabaseTriggered()
         path += ".sqlite";
     }
     rememberDialogDir(path);
+#endif
 
-    // The save dialog already confirmed overwrite if the file existed;
-    // remove it so the database really does start empty, rather than
-    // silently re-opening whatever was there before.
+    // Remove any old file so the database really does start empty.
     if (QFile::exists(path)) {
         QFile::remove(path);
     }
@@ -1764,20 +1928,69 @@ void MainWindow::onNewDatabaseTriggered()
 
 void MainWindow::onOpenDatabaseTriggered()
 {
+    auto openFromPath = [this](const QString& path) {
+        rememberDialogDir(path);
+        if (!openDatabase(path)) {
+            QString message = "Unable to open or load the database.";
+            if (!m_lastOpenError.isEmpty()) {
+                message += "\n\n" + m_lastOpenError;
+            }
+            QMessageBox::critical(this, "Error", message);
+        }
+    };
+
+#ifdef Q_OS_WASM
+    // Browser: the picked file is not on a path SQLite can reach. Get its
+    // bytes, write them into the virtual filesystem, open that copy.
+    QFileDialog::getOpenFileContent(
+        "SQLite databases (*.sqlite *.db *.sqlite3);;All files (*)",
+        [this, openFromPath](const QString& name, const QByteArray& data) {
+            if (name.isEmpty()) {
+                return;
+            }
+            QDir().mkpath("/tmp");
+            const QString path = "/tmp/" + QFileInfo(name).fileName();
+            QFile::remove(path);
+            QFile f(path);
+            if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                QMessageBox::critical(this, "Error", "Cannot write " + path);
+                return;
+            }
+            f.write(data);
+            f.close();
+
+            // WASM SQLite is built without WAL support. If the file header says
+            // WAL (bytes 18/19 == 2), switch it to rollback-journal mode. Data
+            // still sitting in a separate .db-wal file is NOT part of this copy.
+            bool wasWal = false;
+            if (data.size() > 20 && static_cast<unsigned char>(data[18]) == 2
+                && static_cast<unsigned char>(data[19]) == 2) {
+                QFile patch(path);
+                if (patch.open(QIODevice::ReadWrite)) {
+                    patch.seek(18);
+                    patch.write(QByteArray(2, '\x01'));
+                    patch.close();
+                    wasWal = true;
+                }
+            }
+
+            openFromPath(path);
+
+            m_statusLabel->setStyleSheet("color: #888780;");
+            m_statusLabel->setText(QString("Loaded %1: %2 bytes, %3 table(s)%4")
+                                       .arg(QFileInfo(name).fileName())
+                                       .arg(data.size())
+                                       .arg(m_schema.tables().size() + m_schema.vectorTables().size())
+                                       .arg(wasWal ? ", was WAL mode (converted)" : ""));
+        });
+#else
     const QString path = QFileDialog::getOpenFileName(this, "Open SQLite Database", m_defaultDialogDir,
                                                         "SQLite databases (*.sqlite *.db *.sqlite3);;All files (*)");
     if (path.isEmpty()) {
         return;
     }
-    rememberDialogDir(path);
-
-    if (!openDatabase(path)) {
-        QString message = "Unable to open or load the database.";
-        if (!m_lastOpenError.isEmpty()) {
-            message += "\n\n" + m_lastOpenError;
-        }
-        QMessageBox::critical(this, "Error", message);
-    }
+    openFromPath(path);
+#endif
 }
 
 bool MainWindow::execSchemaChange(const QString& sql, const QString& context)
@@ -2080,6 +2293,19 @@ QString MainWindow::quoteForExport(const QVariant& value) const
     return "'" + text + "'";
 }
 
+void MainWindow::onToggleMaximizeResults()
+{
+    m_resultsMaximized = !m_resultsMaximized;
+
+    // Hiding the other panes hands all the space to the results panel.
+    m_bodySplitter->setVisible(!m_resultsMaximized);
+    m_leftPanel->setVisible(!m_resultsMaximized);
+
+    m_maximizeResultsBtn->setText(m_resultsMaximized ? "Restore" : "Maximize");
+    m_maximizeResultsBtn->setToolTip(m_resultsMaximized ? "Restore the normal layout (F11)"
+                                                         : "Show results over the whole window (F11)");
+}
+
 void MainWindow::onExportResultsTriggered()
 {
     const int columnCount = m_resultsTable->columnCount();
@@ -2108,6 +2334,16 @@ void MainWindow::onExportResultsTriggered()
         rows.push_back(row);
     }
 
+#ifdef Q_OS_WASM
+    bool fmtOk = false;
+    const QString fmt = QInputDialog::getItem(this, "Export Results", "Format:",
+                                              QStringList{"csv", "tsv", "json", "sql"}, 0, false, &fmtOk);
+    if (!fmtOk) {
+        return;
+    }
+    QDir().mkpath("/tmp");
+    const QString path = "/tmp/results." + fmt;
+#else
     const QString path = QFileDialog::getSaveFileName(
         this, "Export Results", m_defaultDialogDir,
         "CSV (*.csv);;Tab-separated values (*.tsv);;JSON (*.json);;SQL INSERT statements (*.sql);;All files (*)");
@@ -2115,6 +2351,7 @@ void MainWindow::onExportResultsTriggered()
         return;
     }
     rememberDialogDir(path);
+#endif
 
     // Pick the writer from whatever extension actually ended up in path
     // (typed by hand or added by the chosen filter); anything unrecognized
@@ -2136,6 +2373,9 @@ void MainWindow::onExportResultsTriggered()
         QMessageBox::critical(this, "Export Results", "Could not write to \"" + path + "\".");
         return;
     }
+#ifdef Q_OS_WASM
+    wasmDownload(path);
+#endif
 
     m_statusLabel->setStyleSheet("color: #888780;");
     m_statusLabel->setText("Exported " + QString::number(rowCount) + " row(s) to " + QFileInfo(path).fileName() + ".");
@@ -2247,12 +2487,17 @@ void MainWindow::onExportDatabaseTriggered()
         return;
     }
 
+#ifdef Q_OS_WASM
+    QDir().mkpath("/tmp");
+    const QString path = "/tmp/export.sql";
+#else
     const QString path =
         QFileDialog::getSaveFileName(this, "Export Database", m_defaultDialogDir, "SQL script (*.sql);;All files (*)");
     if (path.isEmpty()) {
         return;
     }
     rememberDialogDir(path);
+#endif
 
     QFile file(path);
     if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -2321,6 +2566,9 @@ void MainWindow::onExportDatabaseTriggered()
     }
 
     file.close();
+#ifdef Q_OS_WASM
+    wasmDownload(path);
+#endif
 
     m_statusLabel->setStyleSheet("color: #888780;");
     m_statusLabel->setText("Exported " + QString::number(dialog.selectedTables().size()) + " table(s), "
@@ -2334,6 +2582,15 @@ void MainWindow::onImportDatabaseTriggered()
         return;
     }
 
+#ifdef Q_OS_WASM
+    QFileDialog::getOpenFileContent("SQL script (*.sql);;All files (*)",
+        [this](const QString& name, const QByteArray& data) {
+            if (name.isEmpty()) {
+                return;
+            }
+            importSqlText(QString::fromUtf8(data));
+        });
+#else
     const QString path =
         QFileDialog::getOpenFileName(this, "Import SQL", m_defaultDialogDir, "SQL script (*.sql);;All files (*)");
     if (path.isEmpty()) {
@@ -2353,7 +2610,12 @@ void MainWindow::onImportDatabaseTriggered()
 #endif
     const QString contents = in.readAll();
     file.close();
+    importSqlText(contents);
+#endif
+}
 
+void MainWindow::importSqlText(const QString& contents)
+{
     const QStringList statements = splitSqlStatements(contents);
     if (statements.isEmpty()) {
         QMessageBox::information(this, "Import Database", "That file has no SQL statements to run.");
