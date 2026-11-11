@@ -71,8 +71,27 @@ QWidget* centeredCheckBox()
 
 CreateTableDialog::CreateTableDialog(QWidget* parent)
     : QDialog(parent)
+    , m_editing(false)
 {
-    setWindowTitle("New Table");
+    init();
+    addColumnRow();  // start with one empty row so the dialog isn't blank
+}
+
+CreateTableDialog::CreateTableDialog(const Table& existing, QWidget* parent)
+    : QDialog(parent)
+    , m_editing(true)
+    , m_originalTableName(existing.name)
+{
+    init();
+    m_nameEdit->setText(existing.name);
+    for (const auto& col : existing.columns) {
+        addColumnRow(&col);
+    }
+}
+
+void CreateTableDialog::init()
+{
+    setWindowTitle(m_editing ? "Edit Table" : "New Table");
     resize(480, 360);
 
     auto* layout = new QVBoxLayout(this);
@@ -83,6 +102,15 @@ CreateTableDialog::CreateTableDialog(QWidget* parent)
     m_nameEdit->setValidator(new QRegularExpressionValidator(kIdentifierPattern, m_nameEdit));
     nameRow->addWidget(m_nameEdit, 1);
     layout->addLayout(nameRow);
+
+    if (m_editing) {
+        auto* hint = new QLabel(
+            "You can rename the table and its columns, add columns and remove columns. SQLite cannot "
+            "change the type, PRIMARY KEY or NOT NULL of an existing column in place, so those are locked.",
+            this);
+        hint->setWordWrap(true);
+        layout->addWidget(hint);
+    }
 
     m_columnsTable = new QTableWidget(0, ColumnCount, this);
     m_columnsTable->setHorizontalHeaderLabels({"Column", "Type", "PK", "NOT NULL"});
@@ -116,7 +144,7 @@ CreateTableDialog::CreateTableDialog(QWidget* parent)
     layout->addLayout(rowButtons);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
-    buttons->button(QDialogButtonBox::Ok)->setText("Create");
+    buttons->button(QDialogButtonBox::Ok)->setText(m_editing ? "Save" : "Create");
     layout->addWidget(buttons);
 
     // "+ Add column" also drops the cursor into the new row's name cell.
@@ -129,23 +157,47 @@ CreateTableDialog::CreateTableDialog(QWidget* parent)
     connect(removeRowBtn, &QPushButton::clicked, this, &CreateTableDialog::removeSelectedRow);
     connect(buttons, &QDialogButtonBox::accepted, this, &CreateTableDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &CreateTableDialog::reject);
-
-    addColumnRow();  // start with one empty row so the dialog isn't blank
 }
 
-void CreateTableDialog::addColumnRow()
+void CreateTableDialog::addColumnRow(const Column* existing)
 {
     const int row = m_columnsTable->rowCount();
     m_columnsTable->insertRow(row);
 
-    m_columnsTable->setItem(row, NameColumn, new QTableWidgetItem());
+    auto* nameItem = new QTableWidgetItem(existing ? existing->name : QString());
+    if (existing) {
+        // Remembered so MainWindow can tell a rename from a drop + add.
+        nameItem->setData(Qt::UserRole, existing->name);
+    }
+    m_columnsTable->setItem(row, NameColumn, nameItem);
 
     auto* typeCombo = new QComboBox();
     typeCombo->addItems(kColumnTypes);
+    if (existing) {
+        // Existing columns can have any declared type (VARCHAR(50), empty, ...).
+        int typeIndex = typeCombo->findText(existing->type, Qt::MatchFixedString);  // case-insensitive
+        if (typeIndex < 0) {
+            typeCombo->addItem(existing->type);
+            typeIndex = typeCombo->count() - 1;
+        }
+        typeCombo->setCurrentIndex(typeIndex);
+        typeCombo->setEnabled(false);
+    }
     m_columnsTable->setCellWidget(row, TypeColumn, typeCombo);
 
-    m_columnsTable->setCellWidget(row, PrimaryKeyColumn, centeredCheckBox());
-    m_columnsTable->setCellWidget(row, NotNullColumn, centeredCheckBox());
+    QWidget* pkCell = centeredCheckBox();
+    QWidget* notNullCell = centeredCheckBox();
+    if (existing) {
+        pkCell->findChild<QCheckBox*>()->setChecked(existing->isPrimaryKey);
+        notNullCell->findChild<QCheckBox*>()->setChecked(existing->isNotNull);
+    }
+    if (m_editing) {
+        // Disabling the cell widget also stops its click-anywhere-to-toggle.
+        pkCell->setEnabled(false);
+        notNullCell->setEnabled(false);
+    }
+    m_columnsTable->setCellWidget(row, PrimaryKeyColumn, pkCell);
+    m_columnsTable->setCellWidget(row, NotNullColumn, notNullCell);
 }
 
 void CreateTableDialog::removeSelectedRow()
@@ -167,6 +219,7 @@ QVector<CreateTableDialog::ColumnDef> CreateTableDialog::columns() const
     for (int row = 0; row < m_columnsTable->rowCount(); ++row) {
         ColumnDef col;
         col.name = m_columnsTable->item(row, NameColumn)->text().trimmed();
+        col.originalName = m_columnsTable->item(row, NameColumn)->data(Qt::UserRole).toString();
         col.type = static_cast<QComboBox*>(m_columnsTable->cellWidget(row, TypeColumn))->currentText();
         col.primaryKey = m_columnsTable->cellWidget(row, PrimaryKeyColumn)->findChild<QCheckBox*>()->isChecked();
         col.notNull = m_columnsTable->cellWidget(row, NotNullColumn)->findChild<QCheckBox*>()->isChecked();
@@ -182,8 +235,13 @@ void CreateTableDialog::accept()
     // typed name is never lost when "Create" is pressed.
     m_columnsTable->setFocus();
 
-    if (!kIdentifierPattern.match(tableName()).hasMatch()) {
-        QMessageBox::warning(this, "New Table",
+    const QString title = windowTitle();
+
+    // In edit mode an untouched name is accepted as-is, even if it isn't a
+    // plain identifier (e.g. a column called "my col" created elsewhere).
+    const bool tableNameUntouched = m_editing && tableName() == m_originalTableName;
+    if (!tableNameUntouched && !kIdentifierPattern.match(tableName()).hasMatch()) {
+        QMessageBox::warning(this, title,
                               "Table name must start with a letter or underscore, and contain only "
                               "letters, numbers, and underscores.");
         return;
@@ -191,21 +249,22 @@ void CreateTableDialog::accept()
 
     const auto cols = columns();
     if (cols.isEmpty()) {
-        QMessageBox::warning(this, "New Table", "Add at least one column.");
+        QMessageBox::warning(this, title, "Add at least one column.");
         return;
     }
 
     QSet<QString> seenNames;
     for (const auto& col : cols) {
-        if (!kIdentifierPattern.match(col.name).hasMatch()) {
-            QMessageBox::warning(this, "New Table",
+        const bool untouched = m_editing && !col.originalName.isEmpty() && col.name == col.originalName;
+        if (!untouched && !kIdentifierPattern.match(col.name).hasMatch()) {
+            QMessageBox::warning(this, title,
                                   "Every column name must start with a letter or underscore, and "
                                   "contain only letters, numbers, and underscores.");
             return;
         }
         const QString key = col.name.toLower();
         if (seenNames.contains(key)) {
-            QMessageBox::warning(this, "New Table",
+            QMessageBox::warning(this, title,
                                   "Column names must be unique: \"" + col.name + "\" is repeated.");
             return;
         }

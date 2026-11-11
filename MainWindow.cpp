@@ -38,6 +38,7 @@
 #include <QSqlQuery>
 #include <QSqlRecord>
 #include <QUrl>
+#include <QVersionNumber>
 #include <QTextCursor>
 #include <QTextStream>
 #include <QVariantMap>
@@ -192,7 +193,29 @@ void wasmDownload(const QString& path)
     }
     QFileDialog::saveFileContent(f.readAll(), QFileInfo(path).fileName());
 }
+
+// Browser: databases are kept in /persist, the IndexedDB-backed folder that
+// main.cpp mounts at start-up. (The rest of the virtual filesystem, /tmp
+// included, is wiped on every page reload.)
+const QString kWasmDbDir = QStringLiteral("/persist/databases");
 #endif
+
+// Called after every change to the open database. Browser: copies the
+// database file from the in-memory filesystem into IndexedDB, so the edit
+// is still there after a page reload. Desktop: nothing to do - the commit
+// already wrote the file.
+void persistDatabase()
+{
+#ifdef Q_OS_WASM
+    EM_ASM({
+        if (typeof FS !== 'undefined') {
+            FS.syncfs(false, function (err) {
+                if (err) { console.error('WinSQLite: saving to browser storage failed', err); }
+            });
+        }
+    });
+#endif
+}
 
 } // namespace
 
@@ -427,15 +450,47 @@ void MainWindow::buildUi()
     m_tableTree->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_tableTree, &QWidget::customContextMenuRequested, this, [this](const QPoint& pos) {
         QTreeWidgetItem* item = m_tableTree->itemAt(pos);
-        if (!item || !item->data(0, Qt::UserRole + 1).toBool()) {
+        if (!item) {
             return;
         }
-        QTreeWidgetItem* top = item->parent() ? item->parent() : item;
-        const QString name = top->data(0, Qt::UserRole + 2).toString();
         QMenu menu(this);
-        QAction* open3d = menu.addAction(tr("Open 3D view"));
-        if (menu.exec(m_tableTree->viewport()->mapToGlobal(pos)) == open3d) {
-            openVectorSpace(name);
+
+        if (item->data(0, Qt::UserRole + 1).toBool()) {
+            QTreeWidgetItem* top = item->parent() ? item->parent() : item;
+            const QString name = top->data(0, Qt::UserRole + 2).toString();
+            QAction* open3d = menu.addAction(tr("Open 3D view"));
+            if (menu.exec(m_tableTree->viewport()->mapToGlobal(pos)) == open3d) {
+                openVectorSpace(name);
+            }
+            return;
+        }
+
+        // Regular tables: right-click the table, one of its columns or one
+        // of its indexes. Index rows carry the index name in UserRole + 3
+        // (see populateTableTree()); every row carries its table in UserRole.
+        const QString indexName = item->data(0, Qt::UserRole + 3).toString();
+        const QString tableName = item->data(0, Qt::UserRole).toString();
+        if (tableName.isEmpty()) {
+            return;
+        }
+        QAction* editIndexAct = nullptr;
+        QAction* editTableAct = menu.addAction(tr("Edit table \"%1\"…").arg(tableName));
+        if (!indexName.isEmpty()) {
+            editIndexAct = menu.addAction(tr("Edit index \"%1\"…").arg(indexName));
+        }
+        QAction* chosen = menu.exec(m_tableTree->viewport()->mapToGlobal(pos));
+        if (!chosen) {
+            return;
+        }
+        if (chosen == editTableAct) {
+            editTable(tableName);
+        } else if (chosen == editIndexAct) {
+            for (const auto& index : m_schema.indexes()) {
+                if (index.name == indexName) {
+                    editIndex(index);
+                    break;
+                }
+            }
         }
     });
     connect(m_sqlEditor, &QPlainTextEdit::textChanged, this, &MainWindow::onSqlTextChanged);
@@ -455,6 +510,31 @@ void MainWindow::buildMenus()
     QAction* openDbAction = databaseMenu->addAction("&Open Database…");
     openDbAction->setShortcut(QKeySequence::Open);
     connect(openDbAction, &QAction::triggered, this, &MainWindow::onOpenDatabaseTriggered);
+
+#ifdef Q_OS_WASM
+    // Databases are kept in the browser's storage between visits; this opens
+    // one of them without having to pick the file from the disk again.
+    QAction* openSavedDbAction = databaseMenu->addAction("Open Sa&ved in Browser…");
+    connect(openSavedDbAction, &QAction::triggered, this, [this]() {
+        const QStringList saved = QDir(kWasmDbDir).entryList({"*.sqlite", "*.db", "*.sqlite3"}, QDir::Files, QDir::Name);
+        if (saved.isEmpty()) {
+            QMessageBox::information(this, "Open Saved Database", "No databases are saved in this browser yet.");
+            return;
+        }
+        bool ok = false;
+        const QString name = QInputDialog::getItem(this, "Open Saved Database", "Database:", saved, 0, false, &ok);
+        if (!ok) {
+            return;
+        }
+        if (!openDatabase(kWasmDbDir + "/" + name)) {
+            QMessageBox::critical(this, "Error", "Unable to open \"" + name + "\".\n\n" + m_lastOpenError);
+        }
+    });
+#endif
+
+    QAction* saveDbAction = databaseMenu->addAction("&Save Database");
+    saveDbAction->setShortcut(QKeySequence::Save);
+    connect(saveDbAction, &QAction::triggered, this, &MainWindow::onSaveDatabaseTriggered);
 
     databaseMenu->addSeparator();
 
@@ -481,6 +561,14 @@ void MainWindow::buildMenus()
 
     schemaMenu->addSeparator();
 
+    QAction* editTableAction = schemaMenu->addAction("&Edit Table…");
+    connect(editTableAction, &QAction::triggered, this, &MainWindow::onEditTableTriggered);
+
+    QAction* editIndexAction = schemaMenu->addAction("Edit I&ndex…");
+    connect(editIndexAction, &QAction::triggered, this, &MainWindow::onEditIndexTriggered);
+
+    schemaMenu->addSeparator();
+
     QAction* dropTableAction = schemaMenu->addAction("Drop Table…");
     connect(dropTableAction, &QAction::triggered, this, &MainWindow::onDropTableTriggered);
 
@@ -504,8 +592,9 @@ void MainWindow::buildMenus()
 
     // These all act on the currently open database, so they start
     // disabled - openDatabase() enables them once one is loaded.
-    m_schemaActions = {newTableAction,  newIndexAction,     dropTableAction, dropIndexAction, insertRowAction,
-                        exportDbAction, exportResultsAction, importDbAction};
+    m_schemaActions = {saveDbAction,    newTableAction,  newIndexAction,     editTableAction,     editIndexAction, dropTableAction,
+                        dropIndexAction, insertRowAction,    exportDbAction,      exportResultsAction,
+                        importDbAction};
     setSchemaActionsEnabled(false);
 
     // Tools > Vector space (3D)... / Create demo vector database... (sqlite-vec).
@@ -747,6 +836,7 @@ void MainWindow::populateTableTree()
             }
             auto* indexItem = new QTreeWidgetItem(tableItem, {label});
             indexItem->setData(0, Qt::UserRole, table.name);
+            indexItem->setData(0, Qt::UserRole + 3, index.name);  // marks an index row (see context menu)
             indexItem->setForeground(0, QColor("#1D9E75"));
         }
     }
@@ -1608,6 +1698,7 @@ void MainWindow::runQuery(const QString& sql)
 
 void MainWindow::onQuerySucceeded(QStringList headers, ResultRows rows)
 {
+    persistDatabase();  // the query may have been an INSERT/UPDATE/DELETE/DDL
     m_queryRunning = false;
     m_executeBtn->setEnabled(true);
     // Queries fired by clicking a point in the 3D view are generated, not
@@ -1900,10 +1991,27 @@ void MainWindow::onSettingsTriggered()
 void MainWindow::onNewDatabaseTriggered()
 {
 #ifdef Q_OS_WASM
-    // Browser: no real disk. A fresh database lives in the in-memory
-    // virtual filesystem; use Export to download it.
-    QDir().mkpath("/tmp");
-    QString path = "/tmp/new.sqlite";
+    // Browser: no real disk. The database is kept in the browser's own
+    // storage (/persist, see main.cpp), so it is still there after a reload;
+    // Save Database downloads a copy as a file.
+    bool nameOk = false;
+    QString name = QInputDialog::getText(this, "New Database", "Database name:", QLineEdit::Normal, "new", &nameOk);
+    name = QFileInfo(name.trimmed()).fileName();
+    if (!nameOk || name.isEmpty()) {
+        return;
+    }
+    if (QFileInfo(name).suffix().isEmpty()) {
+        name += ".sqlite";
+    }
+    QDir().mkpath(kWasmDbDir);
+    QString path = kWasmDbDir + "/" + name;
+    if (QFile::exists(path)) {
+        const auto confirm = QMessageBox::question(
+            this, "New Database", "A saved database named \"" + name + "\" already exists in this browser. Replace it?");
+        if (confirm != QMessageBox::Yes) {
+            return;
+        }
+    }
 #else
     QString path = QFileDialog::getSaveFileName(this, "Create New SQLite Database", m_defaultDialogDir,
                                                   "SQLite databases (*.sqlite *.db *.sqlite3);;All files (*)");
@@ -1923,7 +2031,9 @@ void MainWindow::onNewDatabaseTriggered()
 
     if (!openDatabase(path)) {
         QMessageBox::critical(this, "Error", "Unable to create the database.");
+        return;
     }
+    persistDatabase();
 }
 
 void MainWindow::onOpenDatabaseTriggered()
@@ -1948,8 +2058,32 @@ void MainWindow::onOpenDatabaseTriggered()
             if (name.isEmpty()) {
                 return;
             }
-            QDir().mkpath("/tmp");
-            const QString path = "/tmp/" + QFileInfo(name).fileName();
+            QDir().mkpath(kWasmDbDir);
+            const QString path = kWasmDbDir + "/" + QFileInfo(name).fileName();
+
+            // Opening a file whose name matches a copy that is already saved in
+            // the browser: without this question the old file from the disk
+            // would silently replace the edited copy.
+            if (QFile::exists(path)) {
+                QMessageBox box(QMessageBox::Question, "Open Database",
+                                "\"" + QFileInfo(name).fileName() + "\" is already saved in this browser, "
+                                "with the changes you made earlier.\n\n"
+                                "Open that saved copy, or replace it with the file you just picked?",
+                                QMessageBox::NoButton, this);
+                QPushButton* keepBtn = box.addButton("Open saved copy", QMessageBox::AcceptRole);
+                QPushButton* replaceBtn = box.addButton("Replace with picked file", QMessageBox::DestructiveRole);
+                box.addButton(QMessageBox::Cancel);
+                box.exec();
+                if (box.clickedButton() == keepBtn) {
+                    openFromPath(path);
+                    m_statusLabel->setText("Opened the saved copy of " + QFileInfo(name).fileName());
+                    return;
+                }
+                if (box.clickedButton() != replaceBtn) {
+                    return;
+                }
+            }
+
             QFile::remove(path);
             QFile f(path);
             if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -1958,6 +2092,7 @@ void MainWindow::onOpenDatabaseTriggered()
             }
             f.write(data);
             f.close();
+            persistDatabase();
 
             // WASM SQLite is built without WAL support. If the file header says
             // WAL (bytes 18/19 == 2), switch it to rollback-journal mode. Data
@@ -2005,6 +2140,7 @@ bool MainWindow::execSchemaChange(const QString& sql, const QString& context)
         QMessageBox::critical(this, context, query.lastError().text());
         return false;
     }
+    persistDatabase();
     return true;
 }
 
@@ -2018,6 +2154,7 @@ void MainWindow::applySchemaChange(const QString& sql, const QString& context)
 
 void MainWindow::reloadSchemaAndFocus()
 {
+    persistDatabase();  // also covers SQL import, which runs its statements directly
     if (!m_schema.load(m_db)) {
         showError(m_schema.errorMessage());
         return;
@@ -2103,6 +2240,392 @@ void MainWindow::onNewIndexTriggered()
                              .arg(dialog.isUnique() ? "UNIQUE " : "", dialog.indexName(), dialog.tableName(),
                                   dialog.selectedColumns().join(", "));
     applySchemaChange(sql, "New Index");
+}
+
+namespace {
+
+// Quotes an identifier for SQL ("" escapes a literal quote). The Edit
+// Table/Index code uses it everywhere, so names created outside this app
+// (spaces, keywords, ...) still work.
+QString quoteIdent(const QString& name)
+{
+    QString escaped = name;
+    escaped.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+    return QLatin1Char('"') + escaped + QLatin1Char('"');
+}
+
+}  // namespace
+
+bool MainWindow::execSchemaBatch(const QStringList& statements, const QString& context)
+{
+    if (!m_db.isOpen()) {
+        QMessageBox::warning(this, context, "No database is open.");
+        return false;
+    }
+    if (!m_db.transaction()) {
+        QMessageBox::critical(this, context, m_db.lastError().text());
+        return false;
+    }
+
+    QSqlQuery query(m_db);
+    for (const QString& sql : statements) {
+        if (!query.exec(sql)) {
+            const QString error = query.lastError().text();
+            query.finish();
+            m_db.rollback();
+            QMessageBox::critical(this, context, error + "\n\nStatement:\n" + sql + "\n\nNothing was changed.");
+            return false;
+        }
+        query.finish();
+    }
+
+    if (!m_db.commit()) {
+        const QString error = m_db.lastError().text();
+        m_db.rollback();
+        QMessageBox::critical(this, context, error);
+        return false;
+    }
+
+    persistDatabase();
+    return true;
+}
+
+QString MainWindow::indexWhereClause(const QString& indexName) const
+{
+    QSqlQuery query(m_db);
+    query.prepare("SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?");
+    query.addBindValue(indexName);
+    if (!query.exec() || !query.next()) {
+        return QString();
+    }
+
+    // "CREATE INDEX name ON tbl (cols) WHERE condition"
+    static const QRegularExpression whereRe(
+        QStringLiteral(R"(\)\s*WHERE\s+(.+?)\s*;?\s*$)"),
+        QRegularExpression::CaseInsensitiveOption | QRegularExpression::DotMatchesEverythingOption);
+    const QRegularExpressionMatch match = whereRe.match(query.value(0).toString());
+    return match.hasMatch() ? " WHERE " + match.captured(1) : QString();
+}
+
+void MainWindow::onSaveDatabaseTriggered()
+{
+    if (!m_db.isOpen()) {
+        QMessageBox::warning(this, "Save Database", "No database is open.");
+        return;
+    }
+
+    const QString source = m_db.databaseName();
+    if (!QFileInfo::exists(source)) {
+        QMessageBox::critical(this, "Save Database", "The database file \"" + source + "\" was not found.");
+        return;
+    }
+
+#ifdef Q_OS_WASM
+    // Browser: the open database is a file in the in-memory filesystem, and
+    // every edit has already been committed into it. Saving = handing that
+    // file to the browser as a download (a real .sqlite file, unlike
+    // Export Database, which writes an SQL script).
+    QFile file(source);
+    if (!file.open(QIODevice::ReadOnly)) {
+        QMessageBox::critical(this, "Save Database", "Could not read the database.");
+        return;
+    }
+    QFileDialog::saveFileContent(file.readAll(), QFileInfo(source).fileName());
+#else
+    // Desktop: edits are written to the open file as they are made, so there
+    // is nothing pending. "Save" here means saving a copy under a new name.
+    const QString suggested = QDir(m_defaultDialogDir).filePath(QFileInfo(source).fileName());
+    const QString path = QFileDialog::getSaveFileName(this, "Save Database As", suggested,
+                                                       "SQLite databases (*.sqlite *.db *.sqlite3);;All files (*)");
+    if (path.isEmpty()) {
+        return;
+    }
+    rememberDialogDir(path);
+
+    if (QFileInfo(path) == QFileInfo(source)) {
+        QMessageBox::information(this, "Save Database",
+                                  "This is the file that is already open - all changes are saved in it.");
+        return;
+    }
+    if (QFile::exists(path) && !QFile::remove(path)) {
+        QMessageBox::critical(this, "Save Database", "Could not replace \"" + path + "\".");
+        return;
+    }
+    if (!QFile::copy(source, path)) {
+        QMessageBox::critical(this, "Save Database", "Could not write to \"" + path + "\".");
+        return;
+    }
+    m_statusLabel->setText("Saved a copy to " + QFileInfo(path).fileName());
+#endif
+}
+
+void MainWindow::onEditIndexTriggered()
+{
+    if (m_schema.indexes().isEmpty()) {
+        QMessageBox::information(this, "Edit Index", "There are no indexes to edit.");
+        return;
+    }
+
+    QStringList labels;
+    for (const auto& index : m_schema.indexes()) {
+        labels << index.name + "  (" + index.table + ")";
+    }
+
+    bool ok = false;
+    const QString choice = QInputDialog::getItem(this, "Edit Index", "Index:", labels, 0, false, &ok);
+    if (!ok) {
+        return;
+    }
+
+    const int chosenIndex = labels.indexOf(choice);
+    if (chosenIndex < 0) {
+        return;
+    }
+    editIndex(m_schema.indexes()[chosenIndex]);
+}
+
+void MainWindow::editIndex(const Index& indexRef)
+{
+    // Copy: the schema (and with it indexRef) is reloaded after the change.
+    const Index index = indexRef;
+
+    // Expression indexes (CREATE INDEX i ON t (lower(name))) report an empty
+    // column name; re-creating one from column names alone would corrupt it.
+    for (const QString& col : index.columns) {
+        if (col.isEmpty()) {
+            QMessageBox::information(this, "Edit Index",
+                                      "Index \"" + index.name + "\" is based on an expression, which this "
+                                      "dialog can't edit. Use the SQL editor (DROP INDEX / CREATE INDEX).");
+            return;
+        }
+    }
+
+    // Per-column DESC / COLLATE settings are not part of the dialog; carry
+    // them over for the columns that stay in the index.
+    QHash<QString, QString> columnSuffix;  // lower-cased column name -> " COLLATE x DESC"
+    QSqlQuery xinfo(m_db);
+    if (xinfo.exec("PRAGMA index_xinfo(" + quoteIdent(index.name) + ");")) {
+        while (xinfo.next()) {
+            if (xinfo.value("key").toInt() == 0) {
+                continue;  // trailing rowid column, not part of the user's definition
+            }
+            QString suffix;
+            const QString collation = xinfo.value("coll").toString();
+            if (!collation.isEmpty() && collation.compare("BINARY", Qt::CaseInsensitive) != 0) {
+                suffix += " COLLATE " + collation;
+            }
+            if (xinfo.value("desc").toInt() != 0) {
+                suffix += " DESC";
+            }
+            columnSuffix.insert(xinfo.value("name").toString().toLower(), suffix);
+        }
+    }
+    xinfo.finish();
+
+    CreateIndexDialog dialog(m_schema, index, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    QStringList columnSql;
+    for (const QString& col : dialog.selectedColumns()) {
+        columnSql << quoteIdent(col) + columnSuffix.value(col.toLower());
+    }
+
+    const QString createSql = QString("CREATE %1INDEX %2 ON %3 (%4)%5;")
+                                  .arg(dialog.isUnique() ? "UNIQUE " : "", quoteIdent(dialog.indexName()),
+                                       quoteIdent(index.table), columnSql.join(", "),
+                                       indexWhereClause(index.name));
+
+    // SQLite has no ALTER INDEX: an edit is DROP + CREATE. One transaction,
+    // so if the new definition is rejected (say UNIQUE over duplicate data)
+    // the old index is still there.
+    if (execSchemaBatch({"DROP INDEX " + quoteIdent(index.name) + ";", createSql}, "Edit Index")) {
+        reloadSchemaAndFocus();
+    }
+}
+
+void MainWindow::onEditTableTriggered()
+{
+    if (m_schema.tables().isEmpty()) {
+        QMessageBox::information(this, "Edit Table", "There are no tables to edit.");
+        return;
+    }
+
+    QStringList names;
+    for (const auto& table : m_schema.tables()) {
+        names << table.name;
+    }
+
+    bool ok = false;
+    const QString table = QInputDialog::getItem(this, "Edit Table", "Table:", names,
+                                                 qMax(0, names.indexOf(m_focusTable)), false, &ok);
+    if (!ok) {
+        return;
+    }
+    editTable(table);
+}
+
+void MainWindow::editTable(const QString& tableName)
+{
+    const Table* found = m_schema.findTable(tableName);
+    if (!found) {
+        return;
+    }
+    // Copy: the schema is reloaded after the change.
+    const Table table = *found;
+
+    CreateTableDialog dialog(table, this);
+    if (dialog.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    const QString newName = dialog.tableName();
+    const QVector<CreateTableDialog::ColumnDef> columns = dialog.columns();
+
+    if (newName.compare(table.name, Qt::CaseInsensitive) != 0) {
+        bool taken = false;
+        for (const auto& t : m_schema.tables()) {
+            taken = taken || t.name.compare(newName, Qt::CaseInsensitive) == 0;
+        }
+        for (const auto& t : m_schema.vectorTables()) {
+            taken = taken || t.name.compare(newName, Qt::CaseInsensitive) == 0;
+        }
+        if (taken) {
+            QMessageBox::warning(this, "Edit Table", "A table named \"" + newName + "\" already exists.");
+            return;
+        }
+    }
+
+    // Work out what changed. Existing columns are matched by their original
+    // name (kept in the dialog), so a rename is not mistaken for drop + add.
+    QSet<QString> keptColumns;
+    for (const auto& col : columns) {
+        if (!col.originalName.isEmpty()) {
+            keptColumns.insert(col.originalName);
+        }
+    }
+    QStringList droppedColumns;
+    for (const auto& col : table.columns) {
+        if (!keptColumns.contains(col.name)) {
+            droppedColumns << col.name;
+        }
+    }
+    QVector<std::pair<QString, QString>> renames;  // from, to
+    for (const auto& col : columns) {
+        if (!col.originalName.isEmpty() && col.name != col.originalName) {
+            renames.push_back({col.originalName, col.name});
+        }
+    }
+
+    // ALTER TABLE ... RENAME COLUMN needs SQLite 3.25, DROP COLUMN 3.35.
+    QSqlQuery versionQuery(m_db);
+    QVersionNumber sqliteVersion;
+    if (versionQuery.exec("SELECT sqlite_version();") && versionQuery.next()) {
+        sqliteVersion = QVersionNumber::fromString(versionQuery.value(0).toString());
+    }
+    versionQuery.finish();
+    if (!sqliteVersion.isNull()) {
+        if (!renames.isEmpty() && sqliteVersion < QVersionNumber(3, 25)) {
+            QMessageBox::warning(this, "Edit Table",
+                                  "Renaming columns needs SQLite 3.25 or newer (this one is " +
+                                      sqliteVersion.toString() + ").");
+            return;
+        }
+        if (!droppedColumns.isEmpty() && sqliteVersion < QVersionNumber(3, 35)) {
+            QMessageBox::warning(this, "Edit Table",
+                                  "Removing columns needs SQLite 3.35 or newer (this one is " +
+                                      sqliteVersion.toString() + ").");
+            return;
+        }
+    }
+
+    if (!droppedColumns.isEmpty() && m_confirmDestructiveActions) {
+        const auto confirm = QMessageBox::question(
+            this, "Edit Table",
+            "Delete column(s) " + droppedColumns.join(", ") + " from \"" + table.name +
+                "\" together with all of their data? This cannot be undone.");
+        if (confirm != QMessageBox::Yes) {
+            return;
+        }
+    }
+
+    // Statement order matters: drops first (frees names), then renames, then
+    // adds, and the table rename last so every earlier statement can still
+    // use the old table name. SQLite itself updates indexes, triggers, views
+    // and foreign keys of other tables that mention a renamed table/column.
+    const QString tableRef = quoteIdent(table.name);
+    QStringList statements;
+
+    for (const QString& col : droppedColumns) {
+        statements << "ALTER TABLE " + tableRef + " DROP COLUMN " + quoteIdent(col) + ";";
+    }
+
+    // A rename can only run once its target name is free, which matters for
+    // chains (a -> b, b -> c). A swap (a <-> b) can't be done in one step.
+    QSet<QString> presentNames;  // lower-cased column names at this point of the script
+    for (const auto& col : table.columns) {
+        if (!droppedColumns.contains(col.name)) {
+            presentNames.insert(col.name.toLower());
+        }
+    }
+    auto pending = renames;
+    while (!pending.isEmpty()) {
+        bool progressed = false;
+        for (int i = 0; i < pending.size(); ++i) {
+            const QString from = pending[i].first;
+            const QString to = pending[i].second;
+            const bool onlyCaseChange = from.compare(to, Qt::CaseInsensitive) == 0;
+            if (!onlyCaseChange && presentNames.contains(to.toLower())) {
+                continue;  // target still used by another column: try the others first
+            }
+            statements << "ALTER TABLE " + tableRef + " RENAME COLUMN " + quoteIdent(from) + " TO " +
+                              quoteIdent(to) + ";";
+            presentNames.remove(from.toLower());
+            presentNames.insert(to.toLower());
+            pending.removeAt(i);
+            progressed = true;
+            break;
+        }
+        if (!progressed) {
+            QMessageBox::warning(this, "Edit Table",
+                                  "These column renames swap names with each other, which can't be done in "
+                                  "one step. Rename one of the columns to a temporary name first, save, "
+                                  "then edit again.");
+            return;
+        }
+    }
+
+    for (const auto& col : columns) {
+        if (!col.originalName.isEmpty()) {
+            continue;
+        }
+        QString def = quoteIdent(col.name);
+        if (!col.type.isEmpty()) {
+            def += " " + col.type;
+        }
+        statements << "ALTER TABLE " + tableRef + " ADD COLUMN " + def + ";";
+    }
+
+    if (newName != table.name) {
+        statements << "ALTER TABLE " + tableRef + " RENAME TO " + quoteIdent(newName) + ";";
+    }
+
+    if (statements.isEmpty()) {
+        return;  // nothing changed
+    }
+
+    // Remember before the schema reload whether the query being built reads
+    // this table, so it can be pointed at the table's new name afterwards.
+    const bool queryUsedTable = currentQueryTables().contains(table.name);
+
+    if (!execSchemaBatch(statements, "Edit Table")) {
+        return;
+    }
+    reloadSchemaAndFocus();
+    if (queryUsedTable && m_schema.findTable(newName)) {
+        startQueryFrom(newName);
+    }
 }
 
 void MainWindow::onDropTableTriggered()

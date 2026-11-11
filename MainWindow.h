@@ -75,6 +75,9 @@ private slots:
     void onNewDatabaseTriggered();
     void onOpenDatabaseTriggered();
     void onExportDatabaseTriggered();
+    // Desktop: copies the open database to a file of the person's choice.
+    // Browser: downloads the open database as a .sqlite file.
+    void onSaveDatabaseTriggered();
     void onImportDatabaseTriggered();
 
     // Settings menu.
@@ -86,6 +89,8 @@ private slots:
     // thread is for) and then reloads the schema.
     void onNewTableTriggered();
     void onNewIndexTriggered();
+    void onEditTableTriggered();
+    void onEditIndexTriggered();
     void onDropTableTriggered();
     void onDropIndexTriggered();
 
@@ -159,6 +164,19 @@ private:
     // reloads the schema. Shared by the desktop and WebAssembly import paths.
     void importSqlText(const QString& contents);
     void setSchemaActionsEnabled(bool enabled);
+
+    // Edit Table / Edit Index. The slots above ask which table/index (menu);
+    // these do the work and are also used by the table tree's right-click menu.
+    // Both run all their statements in ONE transaction (execSchemaBatch), so
+    // a failure half-way leaves the database exactly as it was.
+    void editTable(const QString& tableName);
+    void editIndex(const Index& index);
+    // Like execSchemaChange(), but for several statements at once: BEGIN,
+    // run them in order, COMMIT - or ROLLBACK and report if any fails.
+    bool execSchemaBatch(const QStringList& statements, const QString& context);
+    // " WHERE ..." of a partial index (read from sqlite_master), or an empty
+    // string. Editing re-creates the index, and must not lose its condition.
+    QString indexWhereClause(const QString& indexName) const;
 
     // Refreshes everything that depends on m_schema but doesn't depend on
     // which table is focused: the table tree and raw-SQL autocomplete.

@@ -69,6 +69,10 @@ qt_add_executable(sqlite_visual_editor WIN32
 
 set_target_properties(sqlite_visual_editor PROPERTIES WIN32_EXECUTABLE TRUE)
 
+if(MSVC)
+    target_sources(sqlite_visual_editor PRIVATE app.manifest)
+endif()
+
 target_include_directories(sqlite_visual_editor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
 target_link_libraries(sqlite_visual_editor PRIVATE
