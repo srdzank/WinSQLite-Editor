@@ -1,0 +1,5 @@
+<RCC>
+    <qresource prefix="/sample">
+        <file>chinook.db</file>
+    </qresource>
+</RCC>

@@ -44,6 +44,15 @@ if(WIN32)
     set(APP_ICON_RESOURCE_WINDOWS "${CMAKE_CURRENT_SOURCE_DIR}/resources/winsqlite.rc")
 endif()
 
+# Bundled Chinook sample database (Database > Load Sample Database).
+# Only needs the file resources/chinook.db next to this CMakeLists.txt.
+set(SAMPLE_DB_FILE "${CMAKE_CURRENT_SOURCE_DIR}/resources/chinook.db")
+if(NOT EXISTS "${SAMPLE_DB_FILE}")
+    message(FATAL_ERROR
+        "Missing sample database. Copy chinook.db into:\n"
+        "  ${CMAKE_CURRENT_SOURCE_DIR}/resources/")
+endif()
+
 qt_add_executable(sqlite_visual_editor WIN32
     main.cpp
     Schema.cpp
@@ -65,6 +74,12 @@ qt_add_executable(sqlite_visual_editor WIN32
     VectorSupport.cpp
     app.qrc
     ${APP_ICON_RESOURCE_WINDOWS}
+)
+
+qt_add_resources(sqlite_visual_editor "sample"
+    PREFIX "/sample"
+    BASE "${CMAKE_CURRENT_SOURCE_DIR}/resources"
+    FILES "${SAMPLE_DB_FILE}"
 )
 
 set_target_properties(sqlite_visual_editor PROPERTIES WIN32_EXECUTABLE TRUE)

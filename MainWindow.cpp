@@ -34,9 +34,11 @@
 #include <QRegularExpression>
 #include <QSettings>
 #include <QSplitter>
+#include <QStandardPaths>
 #include <QSqlError>
 #include <QSqlQuery>
 #include <QSqlRecord>
+#include <QTimer>
 #include <QUrl>
 #include <QVersionNumber>
 #include <QTextCursor>
@@ -194,28 +196,11 @@ void wasmDownload(const QString& path)
     QFileDialog::saveFileContent(f.readAll(), QFileInfo(path).fileName());
 }
 
-// Browser: databases are kept in /persist, the IndexedDB-backed folder that
-// main.cpp mounts at start-up. (The rest of the virtual filesystem, /tmp
-// included, is wiped on every page reload.)
-const QString kWasmDbDir = QStringLiteral("/persist/databases");
+// Browser: databases are kept in the in-memory virtual filesystem only. They
+// last until the page is closed or reloaded - nothing is written to
+// IndexedDB. Database > Save Database downloads a copy as a .sqlite file.
+const QString kWasmDbDir = QStringLiteral("/tmp");
 #endif
-
-// Called after every change to the open database. Browser: copies the
-// database file from the in-memory filesystem into IndexedDB, so the edit
-// is still there after a page reload. Desktop: nothing to do - the commit
-// already wrote the file.
-void persistDatabase()
-{
-#ifdef Q_OS_WASM
-    EM_ASM({
-        if (typeof FS !== 'undefined') {
-            FS.syncfs(false, function (err) {
-                if (err) { console.error('WinSQLite: saving to browser storage failed', err); }
-            });
-        }
-    });
-#endif
-}
 
 } // namespace
 
@@ -223,6 +208,20 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
     setWindowTitle("WinSQLite");
+
+#ifdef Q_OS_WASM
+    // Earlier builds kept opened databases in /persist/databases, which is
+    // backed by IndexedDB. main.cpp loads all of /persist into memory at every
+    // page start, so a leftover copy came back on every F5 and memory never
+    // dropped. Databases are session-only now: delete any leftover for good.
+    {
+        QDir leftovers(QStringLiteral("/persist/databases"));
+        if (leftovers.exists() && leftovers.removeRecursively()) {
+            EM_ASM({ if (typeof FS !== 'undefined') { FS.syncfs(false, function (err) {}); } });
+        }
+    }
+#endif
+
     loadSettings();
     loadHistory();
     buildUi();
@@ -404,13 +403,20 @@ void MainWindow::buildUi()
     resultsHeader->addWidget(m_maximizeResultsBtn);
     resultsLayout->addLayout(resultsHeader);
 
-    m_resultsTable = new QTableWidget(resultsPanel);
+    m_resultsModel = new ResultsModel(this);
+    m_resultsModel->setEditHandler(
+        [this](int row, int column, const QString& newValue) { return applyResultEdit(row, column, newValue); });
+    m_resultsTable = new QTableView(resultsPanel);
+    m_resultsTable->setModel(m_resultsModel);
     m_resultsTable->setObjectName("resultsTable");
     m_resultsTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
     m_resultsTable->setSelectionBehavior(QAbstractItemView::SelectRows);
     m_resultsTable->setAlternatingRowColors(true);
     m_resultsTable->verticalHeader()->setVisible(false);
     m_resultsTable->horizontalHeader()->setStretchLastSection(true);
+    // Fitting columns to their contents looks at this many rows only, so it
+    // stays instant however long the result is.
+    m_resultsTable->horizontalHeader()->setResizeContentsPrecision(200);
     resultsLayout->addWidget(m_resultsTable, 1);
 
     mainSplitter->addWidget(resultsPanel);
@@ -494,7 +500,6 @@ void MainWindow::buildUi()
         }
     });
     connect(m_sqlEditor, &QPlainTextEdit::textChanged, this, &MainWindow::onSqlTextChanged);
-    connect(m_resultsTable, &QTableWidget::itemChanged, this, &MainWindow::onResultCellEdited);
     connect(m_exportResultsBtn, &QPushButton::clicked, this, &MainWindow::onExportResultsTriggered);
     connect(m_maximizeResultsBtn, &QPushButton::clicked, this, &MainWindow::onToggleMaximizeResults);
 }
@@ -511,26 +516,9 @@ void MainWindow::buildMenus()
     openDbAction->setShortcut(QKeySequence::Open);
     connect(openDbAction, &QAction::triggered, this, &MainWindow::onOpenDatabaseTriggered);
 
-#ifdef Q_OS_WASM
-    // Databases are kept in the browser's storage between visits; this opens
-    // one of them without having to pick the file from the disk again.
-    QAction* openSavedDbAction = databaseMenu->addAction("Open Sa&ved in Browser…");
-    connect(openSavedDbAction, &QAction::triggered, this, [this]() {
-        const QStringList saved = QDir(kWasmDbDir).entryList({"*.sqlite", "*.db", "*.sqlite3"}, QDir::Files, QDir::Name);
-        if (saved.isEmpty()) {
-            QMessageBox::information(this, "Open Saved Database", "No databases are saved in this browser yet.");
-            return;
-        }
-        bool ok = false;
-        const QString name = QInputDialog::getItem(this, "Open Saved Database", "Database:", saved, 0, false, &ok);
-        if (!ok) {
-            return;
-        }
-        if (!openDatabase(kWasmDbDir + "/" + name)) {
-            QMessageBox::critical(this, "Error", "Unable to open \"" + name + "\".\n\n" + m_lastOpenError);
-        }
-    });
-#endif
+    // Not in m_schemaActions: it works with no database open (it creates one).
+    QAction* sampleDbAction = databaseMenu->addAction("Load &Sample Database");
+    connect(sampleDbAction, &QAction::triggered, this, &MainWindow::onLoadSampleDatabaseTriggered);
 
     QAction* saveDbAction = databaseMenu->addAction("&Save Database");
     saveDbAction->setShortcut(QKeySequence::Save);
@@ -647,12 +635,12 @@ void MainWindow::applyDarkTheme()
             background-color: #201F22; border: 1px solid #333230; border-radius: 6px;
             font-family: Consolas, monospace; font-size: %3px; color: #FAC775; padding: 8px;
         }
-        QTableWidget#resultsTable {
+        QTableView#resultsTable {
             background-color: #201F22; border: 1px solid #333230; border-radius: 6px;
             gridline-color: #333230; alternate-background-color: #232226;
         }
-        QTableWidget#resultsTable::item { padding: 4px 8px; }
-        QTableWidget#resultsTable::item:selected { background-color: #0C447C; color: #E6F1FB; }
+        QTableView#resultsTable::item { padding: 4px 8px; }
+        QTableView#resultsTable::item:selected { background-color: #0C447C; color: #E6F1FB; }
         QHeaderView::section {
             background-color: #201F22; color: #888780; border: none;
             border-bottom: 1px solid #333230; padding: 6px 8px; font-size: 10px;
@@ -748,9 +736,7 @@ void MainWindow::resetUiForNewDatabase()
     m_diagramView->clear();
     clearLayout(m_stepsLayout);
     m_sqlPreview->clear();
-    m_resultsTable->clear();
-    m_resultsTable->setRowCount(0);
-    m_resultsTable->setColumnCount(0);
+    m_resultsModel->clear();
     m_exportResultsBtn->setEnabled(false);
     m_statusLabel->clear();
     m_tableTree->clear();
@@ -1698,7 +1684,6 @@ void MainWindow::runQuery(const QString& sql)
 
 void MainWindow::onQuerySucceeded(QStringList headers, ResultRows rows)
 {
-    persistDatabase();  // the query may have been an INSERT/UPDATE/DELETE/DDL
     m_queryRunning = false;
     m_executeBtn->setEnabled(true);
     // Queries fired by clicking a point in the 3D view are generated, not
@@ -1789,48 +1774,17 @@ void MainWindow::onQueryFailed(QString message)
 
 void MainWindow::showResults(const QStringList& headers, const ResultRows& rows)
 {
-    // Cells get populated programmatically below - this keeps those
-    // changes from being mistaken for a user edit by onResultCellEdited.
-    m_populatingResults = true;
-
     const int columnCount = headers.size();
     const bool editable = !m_editableTable.isEmpty();
+    const int rowCount = static_cast<int>(rows.size());
 
-    m_resultsTable->clear();
-    m_resultsTable->setColumnCount(columnCount);
-    m_resultsTable->setHorizontalHeaderLabels(headers);
+    // O(1): the model keeps a reference to the rows, nothing is copied into
+    // per-cell widget items. Only the cells on screen are ever read.
+    m_resultsModel->setResult(headers, rows, editable);
     m_resultsTable->setEditTriggers(
         editable ? QAbstractItemView::EditTriggers(QAbstractItemView::DoubleClicked | QAbstractItemView::EditKeyPressed)
                  : QAbstractItemView::NoEditTriggers);
 
-    m_resultsTable->setRowCount(0);
-    int rowCount = 0;
-    for (const auto& row : rows) {
-        m_resultsTable->insertRow(rowCount);
-
-        // Stashed on column 0's item so onResultCellEdited() can look up
-        // this row's original values (needed for the UPDATE's WHERE
-        // clause) regardless of which cell the user actually edited.
-        QVariantMap rowSnapshot;
-        if (editable) {
-            for (int c = 0; c < columnCount && c < row.size(); ++c) {
-                rowSnapshot.insert(headers[c], row[c]);
-            }
-        }
-
-        for (int c = 0; c < columnCount && c < row.size(); ++c) {
-            auto* item = new QTableWidgetItem(row[c]);
-            item->setToolTip(row[c]);  // full text for cells cut off by the column width cap
-            if (!editable) {
-                item->setFlags(item->flags() & ~Qt::ItemIsEditable);
-            }
-            if (editable && c == 0) {
-                item->setData(Qt::UserRole, rowSnapshot);
-            }
-            m_resultsTable->setItem(rowCount, c, item);
-        }
-        ++rowCount;
-    }
     m_resultsTable->resizeColumnsToContents();
     // Cap very wide columns (long text, JSON, ...) so one column can't push
     // the rest off-screen; the user can still drag the header to widen it,
@@ -1849,8 +1803,6 @@ void MainWindow::showResults(const QStringList& headers, const ResultRows& rows)
     m_statusLabel->setStyleSheet("color: #888780;");
     m_statusLabel->setText(rowCount == 1 ? "1 row" : QString("%1 rows").arg(rowCount));
     m_exportResultsBtn->setEnabled(columnCount > 0);
-
-    m_populatingResults = false;
 }
 
 void MainWindow::showRunning()
@@ -1861,9 +1813,7 @@ void MainWindow::showRunning()
 
 void MainWindow::showError(const QString& message)
 {
-    m_resultsTable->clear();
-    m_resultsTable->setRowCount(0);
-    m_resultsTable->setColumnCount(0);
+    m_resultsModel->clear();
     m_exportResultsBtn->setEnabled(false);
 
     m_statusLabel->setStyleSheet("color: #E5484D;");
@@ -1991,27 +1941,10 @@ void MainWindow::onSettingsTriggered()
 void MainWindow::onNewDatabaseTriggered()
 {
 #ifdef Q_OS_WASM
-    // Browser: no real disk. The database is kept in the browser's own
-    // storage (/persist, see main.cpp), so it is still there after a reload;
-    // Save Database downloads a copy as a file.
-    bool nameOk = false;
-    QString name = QInputDialog::getText(this, "New Database", "Database name:", QLineEdit::Normal, "new", &nameOk);
-    name = QFileInfo(name.trimmed()).fileName();
-    if (!nameOk || name.isEmpty()) {
-        return;
-    }
-    if (QFileInfo(name).suffix().isEmpty()) {
-        name += ".sqlite";
-    }
-    QDir().mkpath(kWasmDbDir);
-    QString path = kWasmDbDir + "/" + name;
-    if (QFile::exists(path)) {
-        const auto confirm = QMessageBox::question(
-            this, "New Database", "A saved database named \"" + name + "\" already exists in this browser. Replace it?");
-        if (confirm != QMessageBox::Yes) {
-            return;
-        }
-    }
+    // Browser: no real disk. A fresh database lives in the in-memory
+    // virtual filesystem; Save Database downloads it.
+    QDir().mkpath("/tmp");
+    QString path = "/tmp/new.sqlite";
 #else
     QString path = QFileDialog::getSaveFileName(this, "Create New SQLite Database", m_defaultDialogDir,
                                                   "SQLite databases (*.sqlite *.db *.sqlite3);;All files (*)");
@@ -2033,7 +1966,44 @@ void MainWindow::onNewDatabaseTriggered()
         QMessageBox::critical(this, "Error", "Unable to create the database.");
         return;
     }
-    persistDatabase();
+}
+
+void MainWindow::onLoadSampleDatabaseTriggered()
+{
+    // The Chinook sample database is compiled into the app as a Qt resource
+    // (resources/sample.qrc). SQLite can't open a resource directly, so copy
+    // it to a real, writable file first and open that copy.
+#ifdef Q_OS_WASM
+    QDir().mkpath(kWasmDbDir);
+    const QString path = kWasmDbDir + "/chinook.db";
+#else
+    const QString path = QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
+                             .filePath("winsqlite_chinook.db");
+#endif
+
+    // Always start from a fresh copy so earlier edits don't carry over.
+    if (QFile::exists(path)) {
+        QFile::remove(path);
+    }
+    if (!QFile::copy(QStringLiteral(":/sample/chinook.db"), path)) {
+        QMessageBox::critical(this, "Error", "Unable to extract the bundled sample database.");
+        return;
+    }
+    // Files copied out of a resource are read-only; the database must be writable.
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ReadUser | QFile::WriteUser);
+
+    if (!openDatabase(path)) {
+        QString message = "Unable to open the sample database.";
+        if (!m_lastOpenError.isEmpty()) {
+            message += "\n\n" + m_lastOpenError;
+        }
+        QMessageBox::critical(this, "Error", message);
+        return;
+    }
+
+    m_statusLabel->setStyleSheet("color: #888780;");
+    m_statusLabel->setText(QString("Loaded sample database (Chinook): %1 table(s)")
+                               .arg(m_schema.tables().size() + m_schema.vectorTables().size()));
 }
 
 void MainWindow::onOpenDatabaseTriggered()
@@ -2061,29 +2031,6 @@ void MainWindow::onOpenDatabaseTriggered()
             QDir().mkpath(kWasmDbDir);
             const QString path = kWasmDbDir + "/" + QFileInfo(name).fileName();
 
-            // Opening a file whose name matches a copy that is already saved in
-            // the browser: without this question the old file from the disk
-            // would silently replace the edited copy.
-            if (QFile::exists(path)) {
-                QMessageBox box(QMessageBox::Question, "Open Database",
-                                "\"" + QFileInfo(name).fileName() + "\" is already saved in this browser, "
-                                "with the changes you made earlier.\n\n"
-                                "Open that saved copy, or replace it with the file you just picked?",
-                                QMessageBox::NoButton, this);
-                QPushButton* keepBtn = box.addButton("Open saved copy", QMessageBox::AcceptRole);
-                QPushButton* replaceBtn = box.addButton("Replace with picked file", QMessageBox::DestructiveRole);
-                box.addButton(QMessageBox::Cancel);
-                box.exec();
-                if (box.clickedButton() == keepBtn) {
-                    openFromPath(path);
-                    m_statusLabel->setText("Opened the saved copy of " + QFileInfo(name).fileName());
-                    return;
-                }
-                if (box.clickedButton() != replaceBtn) {
-                    return;
-                }
-            }
-
             QFile::remove(path);
             QFile f(path);
             if (!f.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -2092,7 +2039,6 @@ void MainWindow::onOpenDatabaseTriggered()
             }
             f.write(data);
             f.close();
-            persistDatabase();
 
             // WASM SQLite is built without WAL support. If the file header says
             // WAL (bytes 18/19 == 2), switch it to rollback-journal mode. Data
@@ -2109,14 +2055,23 @@ void MainWindow::onOpenDatabaseTriggered()
                 }
             }
 
-            openFromPath(path);
+            // Open from the event loop, after this callback has returned: only
+            // then is the picked file's in-memory buffer (as big as the database
+            // itself) released, so it doesn't sit in the heap next to SQLite's
+            // own cache while the schema loads. The heap never shrinks in the
+            // browser, so a lower peak matters.
+            const QString fileName = QFileInfo(name).fileName();
+            const qint64 fileSize = data.size();
+            QTimer::singleShot(0, this, [this, openFromPath, path, fileName, fileSize, wasWal]() {
+                openFromPath(path);
 
-            m_statusLabel->setStyleSheet("color: #888780;");
-            m_statusLabel->setText(QString("Loaded %1: %2 bytes, %3 table(s)%4")
-                                       .arg(QFileInfo(name).fileName())
-                                       .arg(data.size())
-                                       .arg(m_schema.tables().size() + m_schema.vectorTables().size())
-                                       .arg(wasWal ? ", was WAL mode (converted)" : ""));
+                m_statusLabel->setStyleSheet("color: #888780;");
+                m_statusLabel->setText(QString("Loaded %1: %2 bytes, %3 table(s)%4")
+                                           .arg(fileName)
+                                           .arg(fileSize)
+                                           .arg(m_schema.tables().size() + m_schema.vectorTables().size())
+                                           .arg(wasWal ? ", was WAL mode (converted)" : ""));
+            });
         });
 #else
     const QString path = QFileDialog::getOpenFileName(this, "Open SQLite Database", m_defaultDialogDir,
@@ -2140,7 +2095,6 @@ bool MainWindow::execSchemaChange(const QString& sql, const QString& context)
         QMessageBox::critical(this, context, query.lastError().text());
         return false;
     }
-    persistDatabase();
     return true;
 }
 
@@ -2154,7 +2108,6 @@ void MainWindow::applySchemaChange(const QString& sql, const QString& context)
 
 void MainWindow::reloadSchemaAndFocus()
 {
-    persistDatabase();  // also covers SQL import, which runs its statements directly
     if (!m_schema.load(m_db)) {
         showError(m_schema.errorMessage());
         return;
@@ -2286,7 +2239,6 @@ bool MainWindow::execSchemaBatch(const QStringList& statements, const QString& c
         return false;
     }
 
-    persistDatabase();
     return true;
 }
 
@@ -2726,26 +2678,25 @@ void MainWindow::onInsertRowTriggered()
     runQuery("SELECT * FROM " + dialog.tableName() + ";");
 }
 
-void MainWindow::onResultCellEdited(QTableWidgetItem* item)
+bool MainWindow::applyResultEdit(int row, int column, const QString& newValue)
 {
-    if (m_populatingResults || m_editableTable.isEmpty() || !item) {
-        return;
+    const QStringList& headers = m_resultsModel->headers();
+    if (m_editableTable.isEmpty() || row < 0 || row >= m_resultsModel->rows().size() || column < 0
+        || column >= headers.size()) {
+        return false;
     }
 
-    const int row = item->row();
-    const QTableWidgetItem* anchorItem = m_resultsTable->item(row, 0);
-    const QVariantMap snapshot = anchorItem ? anchorItem->data(Qt::UserRole).toMap() : QVariantMap();
-    const QTableWidgetItem* headerItem = m_resultsTable->horizontalHeaderItem(item->column());
-    const QString columnName = headerItem ? headerItem->text() : QString();
-
-    auto revertCell = [this, item](const QString& originalValue) {
-        m_populatingResults = true;
-        item->setText(originalValue);
-        m_populatingResults = false;
-    };
+    // The row as it was when shown (the model has not stored newValue yet):
+    // its key columns identify the database row to update.
+    const QStringList& original = m_resultsModel->rows()[row];
+    QVariantMap snapshot;
+    for (int c = 0; c < headers.size() && c < original.size(); ++c) {
+        snapshot.insert(headers[c], original[c]);
+    }
+    const QString columnName = headers[column];
 
     if (columnName.isEmpty() || snapshot.isEmpty()) {
-        return;
+        return false;
     }
 
     QStringList whereClauses;
@@ -2755,32 +2706,25 @@ void MainWindow::onResultCellEdited(QTableWidgetItem* item)
             // but bail out rather than risk an UPDATE with a wrong WHERE.
             QMessageBox::warning(this, "Update Failed",
                                   "Can't identify this row (missing key column \"" + pk + "\").");
-            revertCell(snapshot.value(columnName).toString());
-            return;
+            return false;
         }
         whereClauses << pk + " = " + sqlLiteral(snapshot.value(pk).toString());
     }
 
-    const QString newValue = item->text();
     const QString sql = "UPDATE " + m_editableTable + "\nSET " + columnName + " = "
                        + (newValue.isEmpty() ? "NULL" : sqlLiteral(newValue)) + "\nWHERE " + whereClauses.join(" AND ")
                        + ";";
 
     if (!execSchemaChange(sql, "Update Row")) {
-        revertCell(snapshot.value(columnName).toString());
-        return;
+        return false;
     }
 
-    // Keep the cached snapshot in sync so later edits to the same row -
-    // including editing a key column itself - still find it correctly.
-    QVariantMap updatedSnapshot = snapshot;
-    updatedSnapshot.insert(columnName, newValue);
-    if (auto* mutableAnchor = m_resultsTable->item(row, 0)) {
-        mutableAnchor->setData(Qt::UserRole, updatedSnapshot);
-    }
-
+    // The model stores newValue in its row once this returns true, so later
+    // edits to the same row - including editing a key column itself - still
+    // find it correctly.
     m_statusLabel->setStyleSheet("color: #888780;");
     m_statusLabel->setText("Saved.");
+    return true;
 }
 
 QString MainWindow::quoteForExport(const QVariant& value) const
@@ -2831,28 +2775,21 @@ void MainWindow::onToggleMaximizeResults()
 
 void MainWindow::onExportResultsTriggered()
 {
-    const int columnCount = m_resultsTable->columnCount();
-    const int rowCount = m_resultsTable->rowCount();
+    const int columnCount = m_resultsModel->headers().size();
+    const int rowCount = static_cast<int>(m_resultsModel->rows().size());
     if (columnCount == 0) {
         QMessageBox::information(this, "Export Results", "Run a query first - there are no results to export.");
         return;
     }
 
-    QStringList headers;
-    headers.reserve(columnCount);
-    for (int c = 0; c < columnCount; ++c) {
-        const auto* headerItem = m_resultsTable->horizontalHeaderItem(c);
-        headers << (headerItem ? headerItem->text() : QString("column%1").arg(c + 1));
-    }
-
+    const QStringList headers = m_resultsModel->headers();
     ResultRows rows;
     rows.reserve(rowCount);
-    for (int r = 0; r < rowCount; ++r) {
+    for (const QStringList& modelRow : m_resultsModel->rows()) {
         QStringList row;
         row.reserve(columnCount);
         for (int c = 0; c < columnCount; ++c) {
-            const auto* item = m_resultsTable->item(r, c);
-            row << (item ? item->text() : QString());
+            row << (c < modelRow.size() ? modelRow[c] : QString());
         }
         rows.push_back(row);
     }

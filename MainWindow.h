@@ -10,6 +10,7 @@
 #include <QSplitter>
 #include <QSqlDatabase>
 #include <QStackedWidget>
+#include <QTableView>
 #include <QTableWidget>
 #include <QThread>
 #include <QTreeWidget>
@@ -20,6 +21,7 @@
 #include "DiagramView.h"
 #include "QueryModel.h"
 #include "QueryWorker.h"
+#include "ResultsModel.h"
 #include "Schema.h"
 #include "SqlEditor.h"
 #include "VectorExplorerDialog.h"
@@ -74,6 +76,9 @@ private slots:
     // Database menu.
     void onNewDatabaseTriggered();
     void onOpenDatabaseTriggered();
+    // Opens a fresh copy of the bundled Chinook sample database
+    // (Qt resource :/sample/chinook.db) so the app can be tried at once.
+    void onLoadSampleDatabaseTriggered();
     void onExportDatabaseTriggered();
     // Desktop: copies the open database to a file of the person's choice.
     // Browser: downloads the open database as a .sqlite file.
@@ -96,7 +101,6 @@ private slots:
 
     // Data menu / results grid editing.
     void onInsertRowTriggered();
-    void onResultCellEdited(QTableWidgetItem* item);
     void onExportResultsTriggered();
     // Results panel Maximize/Restore (button + Data menu + F11).
     void onToggleMaximizeResults();
@@ -146,6 +150,9 @@ private:
     void stopQueryThread();
     void runQuery(const QString& sql);
     void showResults(const QStringList& headers, const ResultRows& rows);
+    // Called by ResultsModel when a cell of an editable result is changed:
+    // runs the UPDATE; returns false (cell reverts) if it failed.
+    bool applyResultEdit(int row, int column, const QString& newValue);
     void showError(const QString& message);
     void showRunning();
 
@@ -280,7 +287,11 @@ private:
     QPushButton* m_addStepBtn = nullptr;
 
     // Bottom panel: query results.
-    QTableWidget* m_resultsTable = nullptr;
+    // The grid is a QTableView over ResultsModel (which only points at the
+    // query's rows) rather than a QTableWidget with one item per cell: showing
+    // even a huge result is then instant.
+    QTableView* m_resultsTable = nullptr;
+    ResultsModel* m_resultsModel = nullptr;
     QLabel* m_statusLabel = nullptr;
     // Exports the currently-displayed grid to CSV/TSV/JSON/SQL. Enabled
     // only while the grid actually has columns (see showResults()).
