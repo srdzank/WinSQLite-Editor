@@ -4,8 +4,10 @@
 
 #include <QDialog>
 #include <QSet>
+#include <optional>
 
 class QLabel;
+class QPushButton;
 class QSpinBox;
 
 namespace vec {
@@ -25,13 +27,19 @@ public:
 signals:
     // Emitted on every click: the vec0 rowid equals the source table's rowid/id.
     void recordActivated(qint64 rowid);
+    // Emitted after the vector of `rowid` was edited and saved.
+    void vectorEdited(qint64 rowid);
 
 private:
     bool loadData(const QString& dbPath);
     void onPointClicked(qint64 rowid);
+    void onEditClicked();
 
     Database       m_db;
+    QString        m_dbPath;
     QString        m_table;
+    QPushButton*   m_editBtn = nullptr;
+    std::optional<qint64> m_selectedId;
     ScatterView3D* m_view   = nullptr;
     QLabel*        m_status = nullptr;
     QSpinBox*      m_k      = nullptr;

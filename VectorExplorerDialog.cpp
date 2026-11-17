@@ -1,8 +1,10 @@
 #include "VectorExplorerDialog.h"
+#include "VectorEditDialog.h"
 
 #include <QApplication>
 #include <QHBoxLayout>
 #include <QLabel>
+#include <QPushButton>
 #include <QSpinBox>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -12,10 +14,10 @@ namespace vec {
 
 VectorExplorerDialog::VectorExplorerDialog(const QString& dbPath, QString vecTable,
                                            ScatterView3D::LabelFn labelFn, QWidget* parent)
-    : QDialog(parent), m_table(std::move(vecTable))
+    : QDialog(parent), m_dbPath(dbPath), m_table(std::move(vecTable))
 {
     setWindowTitle(tr("Vector space - %1").arg(m_table));
-    resize(900, 680);
+    resize(800, 560);
 
     m_view   = new ScatterView3D(this);
     m_status = new QLabel(this);
@@ -24,14 +26,20 @@ VectorExplorerDialog::VectorExplorerDialog(const QString& dbPath, QString vecTab
     m_k->setRange(1, 200);
     m_k->setValue(10);
 
+    m_editBtn = new QPushButton(tr("Edit vector…"), this);
+    m_editBtn->setToolTip(tr("Edit every element of the selected point's vector (click a point first)"));
+    m_editBtn->setEnabled(false);
+    connect(m_editBtn, &QPushButton::clicked, this, &VectorExplorerDialog::onEditClicked);
+
     auto* bar = new QHBoxLayout;
     bar->addWidget(new QLabel(tr("Nearest neighbours (k):"), this));
     bar->addWidget(m_k);
+    bar->addWidget(m_editBtn);
     bar->addWidget(m_status, 1);
 
     auto* root = new QVBoxLayout(this);
+    root->addLayout(bar);   // toolbar on top: stays visible on small screens
     root->addWidget(m_view, 1);
-    root->addLayout(bar);
 
     m_view->setLabelProvider(std::move(labelFn));
     connect(m_view, &ScatterView3D::pointClicked, this, &VectorExplorerDialog::onPointClicked);
@@ -77,8 +85,29 @@ void VectorExplorerDialog::highlightRowids(const QSet<qint64>& rowids, const QSt
     m_status->setText(note);
 }
 
+void VectorExplorerDialog::onEditClicked()
+{
+    if (!m_selectedId)
+        return;
+    const qint64 id = *m_selectedId;
+
+    if (!VectorEditDialog::editRecord(this, m_dbPath, m_table, id))
+        return;
+
+    // The vector changed, so the PCA layout may change too: reload everything,
+    // then reselect the point and recompute its neighbours.
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    loadData(m_dbPath);
+    QApplication::restoreOverrideCursor();
+    m_view->setSelected(id);
+    onPointClicked(id);
+    emit vectorEdited(id);
+}
+
 void VectorExplorerDialog::onPointClicked(qint64 rowid)
 {
+    m_selectedId = rowid;
+    m_editBtn->setEnabled(true);
     emit recordActivated(rowid);
 
     const auto emb = m_db.embeddingOf(m_table, rowid);

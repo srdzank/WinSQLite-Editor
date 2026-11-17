@@ -104,6 +104,9 @@ private slots:
     void onExportResultsTriggered();
     // Results panel Maximize/Restore (button + Data menu + F11).
     void onToggleMaximizeResults();
+    // Right-click in the results grid: "Delete row" (editable results) and
+    // "Edit vector..." (results read from a vec0 table).
+    void onResultsContextMenu(const QPoint& pos);
 
 private:
     void buildUi();
@@ -153,6 +156,13 @@ private:
     // Called by ResultsModel when a cell of an editable result is changed:
     // runs the UPDATE; returns false (cell reverts) if it failed.
     bool applyResultEdit(int row, int column, const QString& newValue);
+    // Deletes the database row shown at grid row `row` (editable results only),
+    // then re-runs the query so the grid is current.
+    bool deleteResultRow(int row);
+    // The vec0 table that sql reads from ("" if none), and the column that holds
+    // its record id ("rowid" unless the table declares its own primary key).
+    QString vecTableForSql(const QString& sql) const;
+    QString vecIdColumn(const QString& vecTable) const;
     void showError(const QString& message);
     void showRunning();
 

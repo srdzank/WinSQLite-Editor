@@ -71,6 +71,7 @@ qt_add_executable(sqlite_visual_editor WIN32
     Projection.cpp
     ScatterView3D.cpp
     VectorExplorerDialog.cpp
+    VectorEditDialog.cpp
     VectorSupport.cpp
     app.qrc
     ${APP_ICON_RESOURCE_WINDOWS}

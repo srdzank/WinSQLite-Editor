@@ -1,5 +1,6 @@
 #include "MainWindow.h"
 #include "VecDatabase.h"
+#include "VectorEditDialog.h"
 #include "VectorExplorerDialog.h"
 #include "VectorSupport.h"
 
@@ -104,6 +105,34 @@ QString sqlLiteral(const QString& rawValue)
         return rawValue;
     }
     return "'" + rawValue + "'";
+}
+
+// Quotes an identifier for SQL ("" escapes a literal quote). Used by the
+// Edit Table/Index code and by the grid editing, so names created outside
+// this app (spaces, keywords, ...) still work.
+QString quoteIdent(const QString& name)
+{
+    QString escaped = name;
+    escaped.replace(QLatin1Char('"'), QStringLiteral("\"\""));
+    return QLatin1Char('"') + escaped + QLatin1Char('"');
+}
+
+// Literal for a value typed into the results grid: empty = NULL, a plain
+// number stays unquoted, anything else is quoted with '' escaping (so an
+// apostrophe in the text can't break the statement).
+QString gridValueLiteral(const QString& text)
+{
+    if (text.isEmpty()) {
+        return QStringLiteral("NULL");
+    }
+    bool isNumber = false;
+    text.toDouble(&isNumber);
+    if (isNumber) {
+        return text;
+    }
+    QString escaped = text;
+    escaped.replace(QLatin1Char('\''), QStringLiteral("''"));
+    return QLatin1Char('\'') + escaped + QLatin1Char('\'');
 }
 
 // Splits a block of SQL text into individual statements on ';', while
@@ -417,6 +446,8 @@ void MainWindow::buildUi()
     // Fitting columns to their contents looks at this many rows only, so it
     // stays instant however long the result is.
     m_resultsTable->horizontalHeader()->setResizeContentsPrecision(200);
+    m_resultsTable->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_resultsTable, &QWidget::customContextMenuRequested, this, &MainWindow::onResultsContextMenu);
     resultsLayout->addWidget(m_resultsTable, 1);
 
     mainSplitter->addWidget(resultsPanel);
@@ -1104,7 +1135,11 @@ void MainWindow::onTreeItemClicked(QTreeWidgetItem* item, int column)
             return;
         }
         vecName.replace(QLatin1Char('"'), QStringLiteral("\"\""));
-        const QString previewSql = QString("SELECT * FROM \"%1\" LIMIT 100;").arg(vecName);
+        // Include rowid when the vec0 table has no primary key of its own, so
+        // the grid knows which record a row is (needed by "Edit vector...").
+        const QString previewSql = (vecIdColumn(item->data(0, Qt::UserRole + 2).toString()) == "rowid")
+            ? QString("SELECT rowid, * FROM \"%1\" LIMIT 100;").arg(vecName)
+            : QString("SELECT * FROM \"%1\" LIMIT 100;").arg(vecName);
 
         if (!m_sqlModeActive) {
             m_sqlModeBtn->setChecked(true);  // fires onSqlModeToggled -> SQL page
@@ -1651,14 +1686,19 @@ void MainWindow::runQuery(const QString& sql)
         return;
     }
 
-    // Direct in-place editing of the results grid is only safe for the
-    // simplest possible query - "SELECT * FROM table", no WHERE/JOIN -
-    // since only then does every displayed row map 1:1 onto a real row
-    // we can find again by primary key. Anything else stays read-only.
+    // Direct in-place editing of the results grid is safe whenever every
+    // displayed row maps 1:1 onto a real row of ONE table, which we can find
+    // again by primary key: "SELECT * FROM table" optionally followed by
+    // WHERE / ORDER BY / LIMIT. JOIN, GROUP BY, UNION, ... stay read-only.
     static const QRegularExpression simpleSelectPattern(
-        R"(^\s*SELECT\s*\*\s*FROM\s+([A-Za-z_][A-Za-z0-9_]*)\s*;?\s*$)", QRegularExpression::CaseInsensitiveOption);
+        R"(^\s*SELECT\s+\*\s+FROM\s+([A-Za-z_][A-Za-z0-9_]*)\b(.*?)\s*;?\s*$)",
+        QRegularExpression::CaseInsensitiveOption | QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression unsafeTail(
+        R"(^\s*,|\b(JOIN|GROUP|HAVING|UNION|INTERSECT|EXCEPT|WINDOW)\b|;)",
+        QRegularExpression::CaseInsensitiveOption);
     const auto match = simpleSelectPattern.match(sql);
-    const QString candidateTable = match.hasMatch() ? resolveTableName(match.captured(1)) : QString();
+    const bool simple = match.hasMatch() && !unsafeTail.match(match.captured(2)).hasMatch();
+    const QString candidateTable = simple ? resolveTableName(match.captured(1)) : QString();
     const Table* candidateSchema = candidateTable.isEmpty() ? nullptr : m_schema.findTable(candidateTable);
 
     m_editableTable.clear();
@@ -2195,20 +2235,6 @@ void MainWindow::onNewIndexTriggered()
     applySchemaChange(sql, "New Index");
 }
 
-namespace {
-
-// Quotes an identifier for SQL ("" escapes a literal quote). The Edit
-// Table/Index code uses it everywhere, so names created outside this app
-// (spaces, keywords, ...) still work.
-QString quoteIdent(const QString& name)
-{
-    QString escaped = name;
-    escaped.replace(QLatin1Char('"'), QStringLiteral("\"\""));
-    return QLatin1Char('"') + escaped + QLatin1Char('"');
-}
-
-}  // namespace
-
 bool MainWindow::execSchemaBatch(const QStringList& statements, const QString& context)
 {
     if (!m_db.isOpen()) {
@@ -2708,12 +2734,11 @@ bool MainWindow::applyResultEdit(int row, int column, const QString& newValue)
                                   "Can't identify this row (missing key column \"" + pk + "\").");
             return false;
         }
-        whereClauses << pk + " = " + sqlLiteral(snapshot.value(pk).toString());
+        whereClauses << quoteIdent(pk) + " = " + gridValueLiteral(snapshot.value(pk).toString());
     }
 
-    const QString sql = "UPDATE " + m_editableTable + "\nSET " + columnName + " = "
-                       + (newValue.isEmpty() ? "NULL" : sqlLiteral(newValue)) + "\nWHERE " + whereClauses.join(" AND ")
-                       + ";";
+    const QString sql = "UPDATE " + quoteIdent(m_editableTable) + "\nSET " + quoteIdent(columnName) + " = "
+                       + gridValueLiteral(newValue) + "\nWHERE " + whereClauses.join(" AND ") + ";";
 
     if (!execSchemaChange(sql, "Update Row")) {
         return false;
@@ -3118,4 +3143,132 @@ void MainWindow::importSqlText(const QString& contents)
         detail += QString("\n\n…and %1 more.").arg(failures.size() - shown);
     }
     QMessageBox::warning(this, "Import finished with errors", summary + "\n\n" + detail);
+}
+
+QString MainWindow::vecTableForSql(const QString& sql) const
+{
+    for (const auto& table : m_schema.vectorTables()) {
+        const QRegularExpression nameRe("\\b" + QRegularExpression::escape(table.name) + "\\b",
+                                        QRegularExpression::CaseInsensitiveOption);
+        if (nameRe.match(sql).hasMatch()) {
+            return table.name;
+        }
+    }
+    return QString();
+}
+
+QString MainWindow::vecIdColumn(const QString& vecTable) const
+{
+    for (const auto& table : m_schema.vectorTables()) {
+        if (table.name.compare(vecTable, Qt::CaseInsensitive) != 0) {
+            continue;
+        }
+        for (const auto& col : table.columns) {
+            if (col.isPrimaryKey) {
+                return col.name;
+            }
+        }
+    }
+    return QStringLiteral("rowid");
+}
+
+void MainWindow::onResultsContextMenu(const QPoint& pos)
+{
+    const QModelIndex index = m_resultsTable->indexAt(pos);
+    if (!index.isValid()) {
+        return;
+    }
+    const int row = index.row();
+    const QStringList& headers = m_resultsModel->headers();
+
+    QMenu menu(this);
+    QAction* deleteAct = nullptr;
+    QAction* vectorAct = nullptr;
+    qint64 vecId = 0;
+    const QString vecTable = vecTableForSql(m_lastSql);
+
+    if (!m_editableTable.isEmpty()) {
+        deleteAct = menu.addAction(tr("Delete row"));
+    }
+
+    if (!vecTable.isEmpty()) {
+        // The grid row must carry the vec0 record id (rowid, or the table's own key column).
+        int idCol = -1;
+        const QStringList idNames = {QStringLiteral("rowid"), vecIdColumn(vecTable)};
+        for (int c = 0; c < headers.size() && idCol < 0; ++c) {
+            for (const QString& name : idNames) {
+                if (headers.at(c).compare(name, Qt::CaseInsensitive) == 0) {
+                    idCol = c;
+                    break;
+                }
+            }
+        }
+        bool ok = false;
+        if (idCol >= 0 && row < m_resultsModel->rows().size()) {
+            vecId = m_resultsModel->rows()[row].value(idCol).toLongLong(&ok);
+        }
+        if (ok) {
+            vectorAct = menu.addAction(tr("Edit vector…"));
+        } else {
+            QAction* hint = menu.addAction(tr("Edit vector… (select rowid in the query)"));
+            hint->setEnabled(false);
+        }
+    }
+
+    if (menu.isEmpty()) {
+        return;
+    }
+
+    QAction* chosen = menu.exec(m_resultsTable->viewport()->mapToGlobal(pos));
+    if (!chosen) {
+        return;
+    }
+    if (chosen == deleteAct) {
+        deleteResultRow(row);
+    } else if (chosen == vectorAct) {
+        if (vec::VectorEditDialog::editRecord(this, m_db.databaseName(), vecTable, vecId)) {
+            m_statusLabel->setStyleSheet("color: #888780;");
+            m_statusLabel->setText(tr("Vector %1 saved.").arg(vecId));
+            // Refresh the grid (and, if open, the 3D view's data stays valid
+            // until it is reopened - use its own Edit button to see updates live).
+            runQuery(m_lastSql);
+        }
+    }
+}
+
+bool MainWindow::deleteResultRow(int row)
+{
+    const QStringList& headers = m_resultsModel->headers();
+    if (m_editableTable.isEmpty() || row < 0 || row >= m_resultsModel->rows().size()) {
+        return false;
+    }
+
+    const QStringList& original = m_resultsModel->rows()[row];
+    QStringList whereClauses;
+    for (const auto& pk : m_editablePkColumns) {
+        const int c = headers.indexOf(pk);
+        if (c < 0 || c >= original.size()) {
+            QMessageBox::warning(this, "Delete Row", "Can't identify this row (missing key column \"" + pk + "\").");
+            return false;
+        }
+        whereClauses << quoteIdent(pk) + " = " + gridValueLiteral(original[c]);
+    }
+
+    if (m_confirmDestructiveActions) {
+        const auto confirm = QMessageBox::question(
+            this, "Delete Row", "Delete this row from \"" + m_editableTable + "\"? This cannot be undone.");
+        if (confirm != QMessageBox::Yes) {
+            return false;
+        }
+    }
+
+    const QString sql = "DELETE FROM " + quoteIdent(m_editableTable) + " WHERE " + whereClauses.join(" AND ") + ";";
+    if (!execSchemaChange(sql, "Delete Row")) {
+        return false;
+    }
+
+    m_statusLabel->setStyleSheet("color: #888780;");
+    m_statusLabel->setText("Row deleted.");
+    runQuery(m_lastSql);  // reload so the grid shows the table as it is now
+    return true;
 }

@@ -305,6 +305,22 @@ bool Database::insertMany(const QString& table, std::span<const Embedding> items
     return exec("COMMIT");
 }
 
+bool Database::updateEmbedding(const QString& table, qint64 rowid, std::span<const float> v)
+{
+    if (!m_db || !isValidIdentifier(table) || v.empty())
+        return error(QStringLiteral("updateEmbedding: invalid arguments"));
+
+    Stmt st = prepare(m_db, "UPDATE " + quoted(table) + " SET embedding = ?1 WHERE " + idColumn(table) + " = ?2");
+    if (!st) return fail("updateEmbedding/prepare");
+
+    sqlite3_bind_blob(st.get(), 1, v.data(), int(v.size_bytes()), SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.get(), 2, rowid);
+    if (sqlite3_step(st.get()) != SQLITE_DONE) return fail("updateEmbedding");
+    if (sqlite3_changes(m_db) == 0)
+        return error(QStringLiteral("updateEmbedding: no record with id %1").arg(rowid));
+    return true;
+}
+
 std::vector<Hit> Database::nearest(const QString& table, std::span<const float> query, int k)
 {
     std::vector<Hit> hits;

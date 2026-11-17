@@ -52,6 +52,11 @@ public:
     bool insert(const QString& table, qint64 rowid, std::span<const float> v);
     bool insertMany(const QString& table, std::span<const Embedding> items); // one transaction
 
+    // UPDATE <table> SET embedding = ? WHERE <id> = ?  (needs a sqlite-vec build
+    // that supports UPDATE on vector columns). The dimension count must match
+    // the existing vector. Returns false and sets lastError() on failure.
+    bool updateEmbedding(const QString& table, qint64 rowid, std::span<const float> v);
+
     // KNN: ... WHERE embedding MATCH ? AND k = ? ORDER BY distance
     std::vector<Hit>        nearest(const QString& table, std::span<const float> query, int k);
     std::vector<Embedding>  loadAll(const QString& table, int limit = 0);
